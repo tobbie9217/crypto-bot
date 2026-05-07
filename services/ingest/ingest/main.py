@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .collectors.cryptopanic import collect_cryptopanic
 from .collectors.lunarcrush import collect_lunarcrush
 from .collectors.reddit import collect_reddit
+from .collectors.telegram_channels import run_telegram_listener
 from .db import DB
 from .settings import settings
 
@@ -71,9 +72,13 @@ async def main() -> None:
 
     scheduler.start()
 
+    # Telegram is long-running rather than scheduled — runs as its own task.
+    telegram_task = asyncio.create_task(safe_run("telegram", run_telegram_listener, db))
+
     try:
         await asyncio.Event().wait()
     finally:
+        telegram_task.cancel()
         scheduler.shutdown()
         await db.close()
 

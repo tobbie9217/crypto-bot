@@ -26,6 +26,8 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://cryptobot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cryptobot
+    volumes:
+      - telegram_session:/app/sessions
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,3 +68,4 @@ services:
 
 volumes:
   postgres_data:
+  telegram_session:
