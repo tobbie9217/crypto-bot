@@ -26,12 +26,11 @@ See `docs/` for week-by-week build notes.
                   [Binance via CCXT]
 ```
 
-Five containers in `docker-compose.yml`:
+Four containers in `docker-compose.yml`:
 - **postgres** — single source of truth (posts, scores, aggregates, events)
-- **ingest** — polls social/news APIs, writes to `posts`
+- **ingest** — polls social/news APIs and runs the Telethon listener for alpha channels (week 7); writes to `posts`
 - **sentiment** — scores posts with CryptoBERT, writes to `sentiment_scores` and rolls up to `sentiment_aggregates` (week 3)
 - **freqtrade** — the trading engine, with Telegram control built in
-- **telegram-collector** — separate Telethon listener for alpha channels (week 7)
 
 ## Quickstart
 
