@@ -1,7 +1,38 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cryptobot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cryptobot
+      POSTGRES_USER: cryptobot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cryptobot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ingest:
+    build: ./services/ingest
+    container_name: cryptobot-ingest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://cryptobot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cryptobot
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   freqtrade:
     image: freqtradeorg/freqtrade:stable
-    container_name: freqtrade
+    container_name: cryptobot-freqtrade
     restart: unless-stopped
     volumes:
       - "./user_data:/freqtrade/user_data"
@@ -9,9 +40,17 @@ services:
       - "127.0.0.1:8080:8080"
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql://cryptobot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cryptobot
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: >
       trade
       --logfile /freqtrade/user_data/logs/freqtrade.log
       --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
       --config /freqtrade/user_data/config.json
-      --strategy SampleStrategy
+      --strategy ${STRATEGY:-SampleStrategy}
+
+volumes:
+  postgres_data:
