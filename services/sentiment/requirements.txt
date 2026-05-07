@@ -1,0 +1,6 @@
+asyncpg>=0.29
+transformers>=4.40
+pydantic>=2.5
+pydantic-settings>=2.1
+structlog>=24.1
+numpy>=1.26

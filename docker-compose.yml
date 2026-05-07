@@ -30,6 +30,18 @@ services:
       postgres:
         condition: service_healthy
 
+  sentiment:
+    build: ./services/sentiment
+    container_name: cryptobot-sentiment
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://cryptobot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cryptobot
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   freqtrade:
     image: freqtradeorg/freqtrade:stable
     container_name: cryptobot-freqtrade
