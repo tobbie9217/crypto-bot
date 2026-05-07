@@ -1,11 +1,11 @@
 {
     "max_open_trades": 3,
     "stake_currency": "USDT",
-    "stake_amount": 100,
-    "tradable_balance_ratio": 0.99,
+    "stake_amount": "unlimited",
+    "tradable_balance_ratio": 0.6,
     "fiat_display_currency": "USD",
     "dry_run": true,
-    "dry_run_wallet": 1000,
+    "dry_run_wallet": 10000,
     "cancel_open_orders_on_exit": false,
     "trading_mode": "spot",
     "margin_mode": "",
@@ -46,6 +46,33 @@
     },
     "pairlists": [
         {"method": "StaticPairList"}
+    ],
+    "protections": [
+        {
+            "method": "CooldownPeriod",
+            "stop_duration_candles": 6
+        },
+        {
+            "method": "MaxDrawdown",
+            "lookback_period_candles": 288,
+            "trade_limit": 20,
+            "stop_duration_candles": 48,
+            "max_allowed_drawdown": 0.05
+        },
+        {
+            "method": "StoplossGuard",
+            "lookback_period_candles": 288,
+            "trade_limit": 4,
+            "stop_duration_candles": 12,
+            "only_per_pair": false
+        },
+        {
+            "method": "LowProfitPairs",
+            "lookback_period_candles": 1440,
+            "trade_limit": 4,
+            "stop_duration_candles": 60,
+            "required_profit": 0.01
+        }
     ],
     "telegram": {
         "enabled": true,
