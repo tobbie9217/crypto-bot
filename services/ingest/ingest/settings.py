@@ -1,8 +1,14 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @field_validator("telegram_api_id", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, v):
+        return None if v == "" else v
 
     database_url: str
 
