@@ -35,16 +35,16 @@ CREATE INDEX IF NOT EXISTS idx_scores_scored   ON sentiment_scores (scored_at DE
 -- Per-coin rolling aggregates the strategy reads on each candle
 CREATE TABLE IF NOT EXISTS sentiment_aggregates (
     coin          TEXT NOT NULL,
-    window        TEXT NOT NULL,      -- '1h', '24h'
+    time_window   TEXT NOT NULL,      -- '1h', '24h'
     bucket_start  TIMESTAMPTZ NOT NULL,
     mean_score    DOUBLE PRECISION NOT NULL,
     post_count    INT NOT NULL,
     z_score       DOUBLE PRECISION,    -- vs 7-day baseline
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (coin, window, bucket_start)
+    PRIMARY KEY (coin, time_window, bucket_start)
 );
 
-CREATE INDEX IF NOT EXISTS idx_agg_recent ON sentiment_aggregates (coin, window, bucket_start DESC);
+CREATE INDEX IF NOT EXISTS idx_agg_recent ON sentiment_aggregates (coin, time_window, bucket_start DESC);
 
 -- Audit/event log: kill-switch flags, manual pauses, errors, etc.
 CREATE TABLE IF NOT EXISTS bot_events (

@@ -66,7 +66,7 @@ class SentimentStrategy(IStrategy):
                         """
                         SELECT mean_score, z_score, post_count
                         FROM sentiment_aggregates
-                        WHERE coin = %s AND window = '1h'
+                        WHERE coin = %s AND time_window = '1h'
                           AND bucket_start >= NOW() - INTERVAL '2 hours'
                         ORDER BY bucket_start DESC
                         LIMIT 1
