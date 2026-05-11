@@ -74,7 +74,7 @@ class TelegramClient:
         chunks = _chunk(text, 3800)
         for i, chunk in enumerate(chunks):
             try:
-                await self.session.post(
+                resp = await self.session.post(
                     f"{self.base}/sendMessage",
                     json={
                         "chat_id": chat_id,
@@ -85,6 +85,29 @@ class TelegramClient:
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("telegram_send_failed", error=str(e), chunk_idx=i)
+                continue
+            if resp.status_code == 400:
+                # Markdown parse failed — retry as plain text so the user sees something.
+                log.warning("telegram_send_markdown_rejected",
+                            chunk_idx=i, body=resp.text[:300])
+                try:
+                    fallback = await self.session.post(
+                        f"{self.base}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": chunk,
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    if fallback.status_code >= 400:
+                        log.error("telegram_send_fallback_failed",
+                                  status=fallback.status_code,
+                                  body=fallback.text[:300])
+                except Exception as e:  # noqa: BLE001
+                    log.error("telegram_send_fallback_exception", error=str(e))
+            elif resp.status_code >= 400:
+                log.error("telegram_send_failed_status",
+                          status=resp.status_code, body=resp.text[:300])
 
 
 def _chunk(text: str, limit: int) -> list[str]:
@@ -150,7 +173,7 @@ HELP_TEXT = (
     "• `/vetoes [days]` — soft-veto reason tally (default 14)\n"
     "• `/help` — this menu\n"
     "\n"
-    "Bot fires trade alerts to your other (@Seifawa_bot) chat. Use this "
+    "Bot fires trade alerts to your other (@Seifawa\\_bot) chat. Use this "
     "bot for on-demand queries."
 )
 
