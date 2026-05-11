@@ -49,7 +49,22 @@ async def main() -> None:
     await db.connect()
     log.info("db_connected")
 
-    scheduler = AsyncIOScheduler()
+    # `coalesce`: if multiple firings stack up while a slow collector is
+    # running, collapse them into one execution instead of running the
+    # backlog serially.
+    # `max_instances=1`: never run two copies of the same collector at
+    # once — prevents double-inserts when a fetch happens to take longer
+    # than its interval (e.g. news_rss polling many feeds).
+    # `misfire_grace_time=60`: tolerate up to 60s of scheduler lag
+    # before skipping a slot (default is 1s, which produces noisy
+    # "Run time was missed by 0:00:01" warnings on startup).
+    scheduler = AsyncIOScheduler(
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 60,
+        },
+    )
     now = datetime.now()
 
     if settings.reddit_client_id and settings.reddit_client_secret:
