@@ -7,3 +7,4 @@ pydantic-settings>=2.1
 structlog>=24.1
 python-dateutil>=2.9
 telethon>=1.36
+feedparser>=6.0

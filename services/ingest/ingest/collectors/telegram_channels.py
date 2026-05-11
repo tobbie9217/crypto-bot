@@ -42,14 +42,20 @@ async def run_telegram_listener(db: DB) -> None:
     async def on_message(event):
         msg = event.message
         text = (msg.message or "").strip()
+        chat = await event.get_chat()
+        chat_username = getattr(chat, "username", None) or str(chat.id)
         if not text:
+            log.info("telegram_message_skipped", chat=chat_username, reason="empty")
             return
         coin = detect_coin(text)
         if coin is None:
+            log.info(
+                "telegram_message_skipped",
+                chat=chat_username,
+                reason="no_tracked_coin",
+                preview=text[:120],
+            )
             return
-
-        chat = await event.get_chat()
-        chat_username = getattr(chat, "username", None) or str(chat.id)
 
         pid = await db.insert_post(
             source="telegram",

@@ -3,28 +3,13 @@ from datetime import datetime, timezone
 import asyncpraw
 import structlog
 
+from ..coins import detect_coin  # re-exported for backwards-compat callers
 from ..db import DB
 from ..settings import settings
 
 log = structlog.get_logger()
 
-# Cheap first-pass coin tagger. Real ticker disambiguation needs more work
-# (e.g. "SOL" vs "sold") — for week 2 this is good enough; we re-tag during
-# sentiment aggregation if needed.
-TICKER_TERMS: dict[str, tuple[str, ...]] = {
-    "BTC": ("btc", "bitcoin", "$btc"),
-    "ETH": ("eth", "ethereum", "ether ", "$eth"),
-    "SOL": ("solana", "$sol"),
-    "BNB": ("bnb", "binance coin", "$bnb"),
-}
-
-
-def detect_coin(text: str) -> str | None:
-    lowered = text.lower()
-    for coin, terms in TICKER_TERMS.items():
-        if any(t in lowered for t in terms):
-            return coin
-    return None
+__all__ = ["detect_coin", "collect_reddit"]
 
 
 async def collect_reddit(db: DB) -> None:

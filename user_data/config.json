@@ -36,42 +36,28 @@
         "secret": "",
         "ccxt_config": {},
         "ccxt_async_config": {},
-        "pair_whitelist": [
-            "BTC/USDT",
-            "ETH/USDT",
-            "SOL/USDT",
-            "BNB/USDT"
-        ],
-        "pair_blacklist": []
+        "pair_whitelist": [],
+        "pair_blacklist": [
+            "BTCDOM/USDT",
+            "DEFI/USDT"
+        ]
     },
     "pairlists": [
-        {"method": "StaticPairList"}
-    ],
-    "protections": [
         {
-            "method": "CooldownPeriod",
-            "stop_duration_candles": 6
+            "method": "VolumePairList",
+            "number_assets": 50,
+            "sort_key": "quoteVolume",
+            "min_value": 1000000,
+            "refresh_period": 1800
         },
+        {"method": "AgeFilter", "min_days_listed": 1},
+        {"method": "PriceFilter", "low_price_ratio": 0.001},
+        {"method": "SpreadFilter", "max_spread_ratio": 0.01},
         {
-            "method": "MaxDrawdown",
-            "lookback_period_candles": 288,
-            "trade_limit": 20,
-            "stop_duration_candles": 48,
-            "max_allowed_drawdown": 0.05
-        },
-        {
-            "method": "StoplossGuard",
-            "lookback_period_candles": 288,
-            "trade_limit": 4,
-            "stop_duration_candles": 12,
-            "only_per_pair": false
-        },
-        {
-            "method": "LowProfitPairs",
-            "lookback_period_candles": 1440,
-            "trade_limit": 4,
-            "stop_duration_candles": 60,
-            "required_profit": 0.01
+            "method": "RangeStabilityFilter",
+            "lookback_days": 3,
+            "min_rate_of_change": 0.03,
+            "refresh_period": 1800
         }
     ],
     "telegram": {

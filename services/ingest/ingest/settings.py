@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # LunarCrush: https://lunarcrush.com/developers
     lunarcrush_token: str | None = None
 
+    # CryptoCompare: https://www.cryptocompare.com/cryptopian/api-keys (free tier)
+    cryptocompare_api_key: str | None = None
+
     # Telegram (week 7) — fill in once you've run the auth flow once
     telegram_api_id: int | None = None
     telegram_api_hash: str | None = None
@@ -38,6 +41,25 @@ class Settings(BaseSettings):
     cryptopanic_interval_s: int = 120
     lunarcrush_interval_s: int = 60
 
+    # RSS-based collectors (no API keys required)
+    news_rss_feeds: str = ""  # comma-separated; empty = use defaults from collector
+    news_rss_interval_s: int = 600
+    reddit_rss_interval_s: int = 120
+
+    # Free, no-key collectors added in the on-chain expansion
+    cryptocompare_news_interval_s: int = 1800   # 30 min — ~50 articles per call
+    coingecko_market_interval_s: int = 300      # 5 min — well under free-tier limits
+    defillama_interval_s: int = 600             # 10 min
+
+    # Phase C: derivatives + market-wide signals
+    binance_derivatives_interval_s: int = 300   # 5 min — funding + mark + OI
+    fear_greed_interval_s: int = 1800           # 30 min — F&G updates daily
+
+    # Binance-native swap-ins (replace CoinGecko market) + new positioning ratios
+    binance_spot_interval_s: int = 300          # 5 min — price/volume/24h-change
+    binance_ratios_interval_s: int = 600        # 10 min — top/global LSR + taker ratio
+    binance_listings_interval_s: int = 1800     # 30 min — detect new symbol listings
+
     log_level: str = "INFO"
 
     @property
@@ -51,6 +73,10 @@ class Settings(BaseSettings):
     @property
     def telegram_channels_list(self) -> list[str]:
         return [c.strip() for c in self.telegram_channels.split(",") if c.strip()]
+
+    @property
+    def news_rss_feeds_list(self) -> list[str]:
+        return [u.strip() for u in self.news_rss_feeds.split(",") if u.strip()]
 
 
 settings = Settings()

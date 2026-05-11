@@ -45,7 +45,8 @@ services:
         condition: service_healthy
 
   freqtrade:
-    image: freqtradeorg/freqtrade:stable
+    build: ./services/freqtrade
+    image: crypto-bot-freqtrade
     container_name: cryptobot-freqtrade
     restart: unless-stopped
     volumes:
@@ -65,6 +66,18 @@ services:
       --db-url sqlite:////freqtrade/user_data/tradesv3.sqlite
       --config /freqtrade/user_data/config.json
       --strategy ${STRATEGY:-SampleStrategy}
+
+  audit_bot:
+    build: ./services/audit_bot
+    container_name: cryptobot-audit-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://cryptobot:${POSTGRES_PASSWORD:-changeme}@postgres:5432/cryptobot
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres_data:

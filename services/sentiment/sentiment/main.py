@@ -4,7 +4,7 @@ import logging
 import asyncpg
 import structlog
 
-from .aggregator import compute_aggregates
+from .aggregator import compute_aggregates, compute_onchain_aggregates
 from .model import CryptoBERT
 from .settings import settings
 
@@ -77,6 +77,9 @@ async def main() -> None:
                 log.info("scored", count=len(rows))
             else:
                 await asyncio.sleep(settings.idle_sleep_s)
+            # On-chain data lands independently of posts, so refresh its
+            # rollups on every tick (cheap — pure SQL on small tables).
+            await compute_onchain_aggregates(pool)
     finally:
         await pool.close()
 

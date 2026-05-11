@@ -51,6 +51,34 @@ class SentimentStrategy(IStrategy):
 
     startup_candle_count: int = 50
 
+    protections = [
+        {
+            "method": "CooldownPeriod",
+            "stop_duration_candles": 6
+        },
+        {
+            "method": "MaxDrawdown",
+            "lookback_period_candles": 288,
+            "trade_limit": 20,
+            "stop_duration_candles": 48,
+            "max_allowed_drawdown": 0.05
+        },
+        {
+            "method": "StoplossGuard",
+            "lookback_period_candles": 288,
+            "trade_limit": 4,
+            "stop_duration_candles": 12,
+            "only_per_pair": False
+        },
+        {
+            "method": "LowProfitPairs",
+            "lookback_period_candles": 1440,
+            "trade_limit": 4,
+            "stop_duration_candles": 60,
+            "required_profit": 0.01
+        }
+    ]
+
     def _db_url(self) -> str:
         return os.environ.get("DATABASE_URL", "")
 

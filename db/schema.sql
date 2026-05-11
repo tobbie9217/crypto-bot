@@ -46,6 +46,65 @@ CREATE TABLE IF NOT EXISTS sentiment_aggregates (
 
 CREATE INDEX IF NOT EXISTS idx_agg_recent ON sentiment_aggregates (coin, time_window, bucket_start DESC);
 
+-- On-chain / market metrics. Time series of structured numeric values
+-- (TVL, price, 24h volume, etc.) keyed by coin + metric + source.
+CREATE TABLE IF NOT EXISTS onchain_metrics (
+    id           BIGSERIAL PRIMARY KEY,
+    coin         TEXT NOT NULL,
+    metric       TEXT NOT NULL,        -- 'price_usd', 'volume_24h', 'market_cap', 'price_change_24h', 'chain_tvl'
+    value        DOUBLE PRECISION NOT NULL,
+    source       TEXT NOT NULL,        -- 'coingecko', 'defillama'
+    observed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    raw          JSONB,
+    UNIQUE (coin, metric, source, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_onchain_coin_metric_time
+    ON onchain_metrics (coin, metric, observed_at DESC);
+
+-- Hourly rollups the strategy reads. Mirrors sentiment_aggregates shape.
+CREATE TABLE IF NOT EXISTS onchain_aggregates (
+    coin          TEXT NOT NULL,
+    metric        TEXT NOT NULL,
+    time_window   TEXT NOT NULL,      -- '1h'
+    bucket_start  TIMESTAMPTZ NOT NULL,
+    value         DOUBLE PRECISION NOT NULL,   -- last value in bucket
+    delta_pct     DOUBLE PRECISION,            -- vs prior bucket
+    z_score       DOUBLE PRECISION,            -- vs 7-day baseline
+    sample_count  INT NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (coin, metric, time_window, bucket_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_onchain_agg_recent
+    ON onchain_aggregates (coin, metric, time_window, bucket_start DESC);
+
+-- Per-trade audit. Strategy hooks (confirm_trade_entry / confirm_trade_exit)
+-- write a row at every entry and exit with the full feature snapshot the
+-- strategy saw — so we can attribute outcomes to signals after the fact.
+CREATE TABLE IF NOT EXISTS trade_journal (
+    id                BIGSERIAL PRIMARY KEY,
+    trade_id          BIGINT,
+    pair              TEXT NOT NULL,
+    coin              TEXT NOT NULL,
+    side              TEXT NOT NULL,        -- 'long'
+    event             TEXT NOT NULL,        -- 'entry' | 'exit'
+    enter_tag         TEXT,                 -- 'strict' | 'momentum'
+    exit_reason       TEXT,
+    rate              DOUBLE PRECISION,
+    profit_ratio      DOUBLE PRECISION,
+    profit_abs        DOUBLE PRECISION,
+    duration_seconds  INTEGER,              -- only on exit rows
+    max_profit_ratio  DOUBLE PRECISION,     -- intra-trade peak
+    min_profit_ratio  DOUBLE PRECISION,     -- intra-trade trough
+    thresholds        JSONB,                -- snapshot of strategy thresholds at entry
+    features          JSONB NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_journal_pair_time ON trade_journal (pair, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_journal_event     ON trade_journal (event, occurred_at DESC);
+
 -- Audit/event log: kill-switch flags, manual pauses, errors, etc.
 CREATE TABLE IF NOT EXISTS bot_events (
     id          BIGSERIAL PRIMARY KEY,

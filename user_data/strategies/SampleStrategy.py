@@ -31,6 +31,34 @@ class SampleStrategy(IStrategy):
 
     startup_candle_count: int = 30
 
+    protections = [
+        {
+            "method": "CooldownPeriod",
+            "stop_duration_candles": 6
+        },
+        {
+            "method": "MaxDrawdown",
+            "lookback_period_candles": 288,
+            "trade_limit": 20,
+            "stop_duration_candles": 48,
+            "max_allowed_drawdown": 0.05
+        },
+        {
+            "method": "StoplossGuard",
+            "lookback_period_candles": 288,
+            "trade_limit": 4,
+            "stop_duration_candles": 12,
+            "only_per_pair": False
+        },
+        {
+            "method": "LowProfitPairs",
+            "lookback_period_candles": 1440,
+            "trade_limit": 4,
+            "stop_duration_candles": 60,
+            "required_profit": 0.01
+        }
+    ]
+
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
         dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=12)

@@ -46,3 +46,32 @@ class DB:
                 source, source_id, coin, text, author, url, posted_at, raw_json,
             )
         return row["id"] if row else None
+
+    async def insert_onchain_metric(
+        self,
+        *,
+        coin: str,
+        metric: str,
+        value: float,
+        source: str,
+        observed_at: datetime,
+        raw: dict[str, Any] | None = None,
+    ) -> int | None:
+        """Insert a single on-chain / market metric observation.
+
+        Idempotent on (coin, metric, source, observed_at) — re-running a
+        collector with overlapping timestamps is safe.
+        """
+        assert self.pool is not None, "DB.connect() not called"
+        raw_json = json.dumps(raw, default=str) if raw is not None else None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO onchain_metrics (coin, metric, value, source, observed_at, raw)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                ON CONFLICT (coin, metric, source, observed_at) DO NOTHING
+                RETURNING id
+                """,
+                coin, metric, value, source, observed_at, raw_json,
+            )
+        return row["id"] if row else None
