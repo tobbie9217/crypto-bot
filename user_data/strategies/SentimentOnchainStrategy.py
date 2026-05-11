@@ -279,12 +279,18 @@ class SentimentOnchainStrategy(IStrategy):
         dataframe["sentiment_count"] = s_count
 
         # --- Layer 2: derivatives ---
+        # Keep the numeric default at 0.0 so exit logic (`funding > 0.001`)
+        # stays False on missing data — we don't want to force-exit when
+        # blind. The `_available` flag is used by the strict entry gate
+        # to refuse new entries when the signal is missing (so a dead
+        # collector can't masquerade as "neutral funding = trade").
         funding_v, _ = self._latest_onchain(coin, "funding_rate")
-        # Treat missing funding as "neutral 0" so the funding gate doesn't
-        # block entries for coins without perp data.
-        dataframe["funding_rate"] = funding_v if funding_v is not None else 0.0
+        dataframe["funding_rate"]      = funding_v if funding_v is not None else 0.0
+        dataframe["funding_available"] = 1 if funding_v is not None else 0
 
         _, oi_z = self._latest_onchain(coin, "open_interest")
+        # `oi_z > 0` already blocks strict entries when oi_z defaults to 0,
+        # so no _available column needed here.
         dataframe["oi_z"] = oi_z if oi_z is not None else 0.0
 
         # --- Layer 3: on-chain & macro ---
@@ -295,10 +301,11 @@ class SentimentOnchainStrategy(IStrategy):
         dataframe["tvl_z"]         = tvl_z if tvl_z is not None else 0.0
         dataframe["has_tvl_data"]  = 1 if tvl_z is not None else 0
 
+        # F&G keeps the 50.0 default so exit logic (`fng > 85`) stays
+        # False on missing data. Strict entry gates on `fng_available`.
         fng_value, _ = self._latest_onchain("MARKET", "fear_greed_index")
-        # Default to 50 (neutral) when missing so the F&G gate doesn't
-        # accidentally block entries on data-collection hiccups.
-        dataframe["fng"] = fng_value if fng_value is not None else 50.0
+        dataframe["fng"]            = fng_value if fng_value is not None else 50.0
+        dataframe["fng_available"]  = 1 if fng_value is not None else 0
 
         return dataframe
 
@@ -309,16 +316,23 @@ class SentimentOnchainStrategy(IStrategy):
         htf_not_overbought = dataframe["rsi_1h"] < 75
 
         # ----- Strict path: high-conviction, multi-signal confluence -----
+        # `funding_available` / `fng_available` gates close the silent-
+        # default loophole: previously a dead funding or F&G collector
+        # produced 0.0 / 50.0 — both of which slid through the gate as
+        # "neutral = trade". Now strict entries require the data to be
+        # genuinely present at decision time.
         strict = (
             (dataframe["sentiment_z"] > self.SENTIMENT_Z_MIN)
             & (dataframe["sentiment_mean"] > self.SENTIMENT_MEAN_MIN)
             & (dataframe["sentiment_count"] >= self.SENTIMENT_COUNT_MIN)
+            & (dataframe["funding_available"] == 1)
             & (dataframe["funding_rate"] < self.FUNDING_MAX_ENTER)
             & (dataframe["oi_z"] > self.OI_Z_MIN)
             & (
                 (dataframe["tvl_z"] > self.TVL_Z_MIN)
                 | (dataframe["has_tvl_data"] == 0)
             )
+            & (dataframe["fng_available"] == 1)
             & (dataframe["fng"] < self.FNG_MAX_ENTER)
             & (dataframe["rsi"] < 70)
             & (dataframe["ema_fast"] > dataframe["ema_slow"])
@@ -458,7 +472,9 @@ class SentimentOnchainStrategy(IStrategy):
         "close", "rsi", "ema_fast", "ema_slow",
         "rsi_1h", "ema_fast_1h", "ema_slow_1h",
         "sentiment_mean", "sentiment_z", "sentiment_count",
-        "funding_rate", "oi_z", "tvl_z", "has_tvl_data", "fng",
+        "funding_rate", "funding_available",
+        "oi_z", "tvl_z", "has_tvl_data",
+        "fng", "fng_available",
         "price_change_1h", "volume_ratio",
     )
 
