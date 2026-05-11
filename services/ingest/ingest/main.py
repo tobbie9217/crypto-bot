@@ -1,10 +1,31 @@
 import asyncio
 import logging
 import signal
+import time
 from datetime import datetime
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+HEARTBEAT_PATH = "/tmp/healthz"
+HEARTBEAT_INTERVAL_S = 30
+
+
+async def _heartbeat() -> None:
+    """Touch HEARTBEAT_PATH every HEARTBEAT_INTERVAL_S seconds.
+
+    The docker healthcheck reads this file's mtime to decide whether
+    the container is alive. Failure to write (full disk, read-only fs)
+    is logged but doesn't crash the service.
+    """
+    log = structlog.get_logger().bind(task="heartbeat")
+    while True:
+        try:
+            with open(HEARTBEAT_PATH, "w") as f:
+                f.write(str(time.time()))
+        except OSError as e:
+            log.warning("heartbeat_write_failed", error=str(e))
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
 from .collectors.binance_derivatives import collect_binance_derivatives
 from .collectors.binance_listings import collect_binance_listings
@@ -157,6 +178,7 @@ async def main() -> None:
 
     # Telegram is long-running rather than scheduled — runs as its own task.
     telegram_task = asyncio.create_task(safe_run("telegram", run_telegram_listener, db))
+    heartbeat_task = asyncio.create_task(_heartbeat())
 
     # SIGTERM/SIGINT → set the stop event so we exit the await below
     # cleanly instead of being SIGKILLed by Docker 10–15 seconds later.
@@ -174,11 +196,12 @@ async def main() -> None:
         await stop_event.wait()
     finally:
         log.info("shutdown_initiated")
-        telegram_task.cancel()
-        try:
-            await telegram_task
-        except asyncio.CancelledError:
-            pass
+        for task in (telegram_task, heartbeat_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         scheduler.shutdown(wait=True)
         await db.close()
         log.info("shutdown_complete")

@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import signal
+import time
 
 import asyncpg
 import structlog
@@ -7,6 +9,22 @@ import structlog
 from .aggregator import compute_aggregates, compute_onchain_aggregates
 from .model import CryptoBERT
 from .settings import settings
+
+HEARTBEAT_PATH = "/tmp/healthz"
+HEARTBEAT_INTERVAL_S = 30
+
+
+async def _heartbeat() -> None:
+    """Touch HEARTBEAT_PATH every HEARTBEAT_INTERVAL_S seconds for
+    the docker healthcheck. See ingest/main.py for the same pattern."""
+    log = structlog.get_logger().bind(task="heartbeat")
+    while True:
+        try:
+            with open(HEARTBEAT_PATH, "w") as f:
+                f.write(str(time.time()))
+        except OSError as e:
+            log.warning("heartbeat_write_failed", error=str(e))
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
 
 def configure_logging() -> None:
@@ -66,8 +84,20 @@ async def main() -> None:
     log.info("connecting_db")
     pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=3)
 
+    heartbeat_task = asyncio.create_task(_heartbeat())
+
+    # SIGTERM/SIGINT → flip stop_event so the while-loop below exits
+    # on the next iteration instead of being SIGKILLed by Docker.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
     try:
-        while True:
+        while not stop_event.is_set():
             rows = await fetch_unscored(pool, settings.batch_size)
             if rows:
                 texts = [r["text"] for r in rows]
@@ -76,12 +106,25 @@ async def main() -> None:
                 await compute_aggregates(pool)
                 log.info("scored", count=len(rows))
             else:
-                await asyncio.sleep(settings.idle_sleep_s)
+                # Sleep but break early if shutdown was requested mid-sleep.
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=settings.idle_sleep_s
+                    )
+                except asyncio.TimeoutError:
+                    pass
             # On-chain data lands independently of posts, so refresh its
             # rollups on every tick (cheap — pure SQL on small tables).
             await compute_onchain_aggregates(pool)
     finally:
+        log.info("shutdown_initiated")
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         await pool.close()
+        log.info("shutdown_complete")
 
 
 if __name__ == "__main__":

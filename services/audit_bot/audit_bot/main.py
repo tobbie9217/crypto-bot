@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import statistics
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -36,6 +37,22 @@ def _configure_logging() -> None:
 
 
 log = structlog.get_logger()
+
+
+HEARTBEAT_PATH = "/tmp/healthz"
+HEARTBEAT_INTERVAL_S = 30
+
+
+async def _heartbeat() -> None:
+    """Touch HEARTBEAT_PATH every HEARTBEAT_INTERVAL_S seconds for the
+    docker healthcheck. Same pattern as ingest/sentiment."""
+    while True:
+        try:
+            with open(HEARTBEAT_PATH, "w") as f:
+                f.write(str(time.time()))
+        except OSError as e:
+            log.warning("heartbeat_write_failed", error=str(e))
+        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
 
 # ----------------- Telegram I/O -----------------
@@ -503,6 +520,7 @@ async def main() -> None:
             pass
 
     stop_wait_task = asyncio.create_task(stop_event.wait())
+    heartbeat_task = asyncio.create_task(_heartbeat())
 
     try:
         while not stop_event.is_set():
@@ -527,12 +545,13 @@ async def main() -> None:
                 await handle_update(u, allowed_chat_id, tg, pool)
     finally:
         log.info("audit_bot_shutdown")
-        if not stop_wait_task.done():
-            stop_wait_task.cancel()
-            try:
-                await stop_wait_task
-            except asyncio.CancelledError:
-                pass
+        for task in (stop_wait_task, heartbeat_task):
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await tg.close()
         await pool.close()
 

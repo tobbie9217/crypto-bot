@@ -31,6 +31,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # /tmp/healthz is touched every 30s by an asyncio task in main.py.
+      # If we haven't seen a write in 90s, the main loop has stalled.
+      test: ["CMD-SHELL", "python -c 'import os,time; assert time.time()-os.stat(\"/tmp/healthz\").st_mtime<90'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   sentiment:
     build: ./services/sentiment
@@ -43,6 +51,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,time; assert time.time()-os.stat(\"/tmp/healthz\").st_mtime<90'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # CryptoBERT model load on cold cache can take ~30–60s.
+      start_period: 90s
 
   freqtrade:
     build: ./services/freqtrade
@@ -60,6 +75,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ingest:
+        condition: service_healthy
+      sentiment:
+        condition: service_healthy
+    healthcheck:
+      # API server bound to 0.0.0.0:8080 inside the container; a TCP
+      # connect proves the freqtrade web server is up.
+      test: ["CMD-SHELL", "python -c 'import socket; s=socket.socket(); s.settimeout(3); s.connect((\"127.0.0.1\",8080)); s.close()'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Pair-list discovery + exchange handshake can take 30–45s.
+      start_period: 60s
     command: >
       trade
       --logfile /freqtrade/user_data/logs/freqtrade.log
@@ -78,6 +106,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,time; assert time.time()-os.stat(\"/tmp/healthz\").st_mtime<90'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   postgres_data:
