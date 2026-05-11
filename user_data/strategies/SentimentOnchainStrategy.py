@@ -29,12 +29,13 @@ import urllib.request
 from datetime import datetime
 from typing import Optional
 
-import psycopg2
 import psycopg2.extras
 import talib.abstract as ta
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, merge_informative_pair
 from pandas import DataFrame
+
+from db_pool import get_conn, report_db_error
 
 
 class SentimentOnchainStrategy(IStrategy):
@@ -161,16 +162,21 @@ class SentimentOnchainStrategy(IStrategy):
 
     # ----------------------- DB helpers -----------------------
 
-    def _db_url(self) -> str:
-        return os.environ.get("DATABASE_URL", "")
-
     def _latest_sentiment(self, coin: str) -> tuple[float, float, int]:
-        """Return (mean, z, count) for the last 1h sentiment bucket."""
-        url = self._db_url()
-        if not url:
-            return (0.0, 0.0, 0)
+        """Return (mean, z, count) for the last 1h sentiment bucket.
+
+        Returns (0.0, 0.0, 0) when no row exists OR the DB is unreachable.
+        Exceptions are logged via report_db_error (rate-limited) rather
+        than swallowed silently — see audit finding #2.
+        """
         try:
-            with psycopg2.connect(url, connect_timeout=5) as conn:
+            with get_conn() as conn:
+                if conn is None:
+                    report_db_error(
+                        "sentiment_lookup_no_pool",
+                        RuntimeError("DB pool unavailable (DATABASE_URL unset or init failed)"),
+                    )
+                    return (0.0, 0.0, 0)
                 with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                     cur.execute(
                         """
@@ -189,19 +195,22 @@ class SentimentOnchainStrategy(IStrategy):
                             float(row["z_score"] or 0.0),
                             int(row["post_count"]),
                         )
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            report_db_error("sentiment_lookup", e)
         return (0.0, 0.0, 0)
 
     def _latest_onchain(
         self, coin: str, metric: str
     ) -> tuple[Optional[float], Optional[float]]:
         """Return (value, z_score) for the latest 1h on-chain bucket, or (None, None)."""
-        url = self._db_url()
-        if not url:
-            return (None, None)
         try:
-            with psycopg2.connect(url, connect_timeout=5) as conn:
+            with get_conn() as conn:
+                if conn is None:
+                    report_db_error(
+                        "onchain_lookup_no_pool",
+                        RuntimeError("DB pool unavailable (DATABASE_URL unset or init failed)"),
+                    )
+                    return (None, None)
                 with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                     cur.execute(
                         """
@@ -219,8 +228,8 @@ class SentimentOnchainStrategy(IStrategy):
                             float(row["value"]) if row["value"] is not None else None,
                             float(row["z_score"]) if row["z_score"] is not None else None,
                         )
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            report_db_error(f"onchain_lookup:{metric}", e)
         return (None, None)
 
     # ----------------------- Strategy hooks -----------------------
@@ -560,35 +569,44 @@ class SentimentOnchainStrategy(IStrategy):
         min_profit_ratio: Optional[float] = None,
         thresholds: Optional[dict] = None,
     ) -> None:
-        url = self._db_url()
-        if not url:
-            return
         coin = pair.split("/")[0]
         features = self._snapshot_features(pair)
         try:
-            with psycopg2.connect(url, connect_timeout=5) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO trade_journal
-                            (trade_id, pair, coin, side, event, enter_tag,
-                             exit_reason, rate, profit_ratio, profit_abs,
-                             duration_seconds, max_profit_ratio, min_profit_ratio,
-                             thresholds, features)
-                        VALUES (%s, %s, %s, 'long', %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s::jsonb, %s::jsonb)
-                        """,
-                        (
-                            trade_id, pair, coin, event, enter_tag,
-                            exit_reason, rate, profit_ratio, profit_abs,
-                            duration_seconds, max_profit_ratio, min_profit_ratio,
-                            json.dumps(thresholds, default=str) if thresholds is not None else None,
-                            json.dumps(features, default=str),
-                        ),
+            with get_conn() as conn:
+                if conn is None:
+                    report_db_error(
+                        "journal_write_no_pool",
+                        RuntimeError("DB pool unavailable (DATABASE_URL unset or init failed)"),
                     )
-        except Exception:
-            # Journaling must never block a trade. Swallow DB errors.
-            pass
+                    return
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO trade_journal
+                                (trade_id, pair, coin, side, event, enter_tag,
+                                 exit_reason, rate, profit_ratio, profit_abs,
+                                 duration_seconds, max_profit_ratio, min_profit_ratio,
+                                 thresholds, features)
+                            VALUES (%s, %s, %s, 'long', %s, %s, %s, %s, %s, %s,
+                                    %s, %s, %s, %s::jsonb, %s::jsonb)
+                            """,
+                            (
+                                trade_id, pair, coin, event, enter_tag,
+                                exit_reason, rate, profit_ratio, profit_abs,
+                                duration_seconds, max_profit_ratio, min_profit_ratio,
+                                json.dumps(thresholds, default=str) if thresholds is not None else None,
+                                json.dumps(features, default=str),
+                            ),
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+        except Exception as e:  # noqa: BLE001
+            # Journaling must never block a trade — but the failure
+            # itself must be visible.
+            report_db_error(f"journal_write:{event}", e)
 
         # Best-effort rich notification. Skipped for `attempted_entry`
         # (high volume) and on errors. Never blocks the trade flow.

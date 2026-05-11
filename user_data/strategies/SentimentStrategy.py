@@ -15,14 +15,14 @@ Exit conditions (ANY triggers):
 - mean sentiment < -0.1           (sentiment flipped)
 - RSI > 80                        (extreme overbought)
 """
-import os
 from typing import Optional
 
-import psycopg2
 import psycopg2.extras
 import talib.abstract as ta
 from freqtrade.strategy import IStrategy
 from pandas import DataFrame
+
+from db_pool import get_conn, report_db_error
 
 
 class SentimentStrategy(IStrategy):
@@ -79,16 +79,16 @@ class SentimentStrategy(IStrategy):
         }
     ]
 
-    def _db_url(self) -> str:
-        return os.environ.get("DATABASE_URL", "")
-
     def _latest_sentiment(self, coin: str) -> tuple[float, float, int]:
         """Return (mean, z_score, count) for the most recent 1h bucket, or zeros."""
-        url = self._db_url()
-        if not url:
-            return (0.0, 0.0, 0)
         try:
-            with psycopg2.connect(url, connect_timeout=5) as conn:
+            with get_conn() as conn:
+                if conn is None:
+                    report_db_error(
+                        "sentiment_lookup_no_pool",
+                        RuntimeError("DB pool unavailable (DATABASE_URL unset or init failed)"),
+                    )
+                    return (0.0, 0.0, 0)
                 with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                     cur.execute(
                         """
@@ -108,10 +108,10 @@ class SentimentStrategy(IStrategy):
                             float(row["z_score"] or 0.0),
                             int(row["post_count"]),
                         )
-        except Exception:
-            # Strategy must never crash from a DB hiccup. Falling back to
-            # neutral zeros effectively disables sentiment for this candle.
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Strategy must never crash from a DB hiccup, but the failure
+            # must be visible — log loudly via report_db_error (rate-limited).
+            report_db_error("sentiment_lookup", e)
         return (0.0, 0.0, 0)
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
