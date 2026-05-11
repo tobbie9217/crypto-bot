@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import statistics
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -490,12 +491,48 @@ async def main() -> None:
     tg = TelegramClient(token)
     log.info("audit_bot_starting", chat_id=allowed_chat_id)
 
+    # SIGTERM/SIGINT → set the stop event so the poll loop can exit
+    # within a heartbeat instead of waiting up to 30s for the current
+    # Telegram long-poll to time out.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    stop_wait_task = asyncio.create_task(stop_event.wait())
+
     try:
-        while True:
-            updates = await tg.get_updates()
+        while not stop_event.is_set():
+            poll_task = asyncio.create_task(tg.get_updates())
+            await asyncio.wait(
+                {poll_task, stop_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_event.is_set():
+                poll_task.cancel()
+                try:
+                    await poll_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                break
+            try:
+                updates = poll_task.result()
+            except Exception as e:  # noqa: BLE001
+                log.warning("telegram_poll_failed", error=str(e))
+                updates = []
             for u in updates:
                 await handle_update(u, allowed_chat_id, tg, pool)
     finally:
+        log.info("audit_bot_shutdown")
+        if not stop_wait_task.done():
+            stop_wait_task.cancel()
+            try:
+                await stop_wait_task
+            except asyncio.CancelledError:
+                pass
         await tg.close()
         await pool.close()
 

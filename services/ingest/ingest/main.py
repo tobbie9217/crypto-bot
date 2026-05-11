@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 from datetime import datetime
 
 import structlog
@@ -157,12 +158,30 @@ async def main() -> None:
     # Telegram is long-running rather than scheduled — runs as its own task.
     telegram_task = asyncio.create_task(safe_run("telegram", run_telegram_listener, db))
 
+    # SIGTERM/SIGINT → set the stop event so we exit the await below
+    # cleanly instead of being SIGKILLed by Docker 10–15 seconds later.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # Windows event loop doesn't support add_signal_handler;
+            # the containers run on Linux so we only hit this in tests.
+            pass
+
     try:
-        await asyncio.Event().wait()
+        await stop_event.wait()
     finally:
+        log.info("shutdown_initiated")
         telegram_task.cancel()
-        scheduler.shutdown()
+        try:
+            await telegram_task
+        except asyncio.CancelledError:
+            pass
+        scheduler.shutdown(wait=True)
         await db.close()
+        log.info("shutdown_complete")
 
 
 if __name__ == "__main__":
