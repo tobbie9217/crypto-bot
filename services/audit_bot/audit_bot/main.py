@@ -57,6 +57,32 @@ async def _heartbeat() -> None:
 
 # ----------------- Telegram I/O -----------------
 
+# Slash-menu (the one that appears when you type `/` in the chat).
+# Registered with Telegram once at startup via setMyCommands.
+SLASH_COMMANDS = [
+    {"command": "audit",  "description": "Full audit report (default last 14 days)"},
+    {"command": "stats",  "description": "Quick headline numbers (default 14 days)"},
+    {"command": "why",    "description": "Last trades for a pair, e.g. /why BTC/USDT"},
+    {"command": "recent", "description": "Last N events (default 10)"},
+    {"command": "vetoes", "description": "Soft-veto reason tally (default 14 days)"},
+    {"command": "help",   "description": "Show available commands"},
+]
+
+# Persistent quick-tap keyboard at the bottom of the chat. Attached
+# to every outbound message so it never disappears. Only the
+# parameter-less commands get buttons — /why needs a pair argument
+# and is left to typing or the slash menu.
+QUICK_KEYBOARD = {
+    "keyboard": [
+        [{"text": "/audit"},  {"text": "/stats"}],
+        [{"text": "/recent"}, {"text": "/vetoes"}],
+        [{"text": "/help"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+}
+
+
 class TelegramClient:
     def __init__(self, token: str) -> None:
         self.token = token
@@ -66,6 +92,20 @@ class TelegramClient:
 
     async def close(self) -> None:
         await self.session.aclose()
+
+    async def register_commands(self) -> None:
+        """Tell Telegram about our slash commands so the `/` autocomplete
+        menu shows them with descriptions. One-shot at startup."""
+        try:
+            resp = await self.session.post(
+                f"{self.base}/setMyCommands",
+                json={"commands": SLASH_COMMANDS},
+            )
+            if resp.status_code >= 400:
+                log.warning("telegram_setmycommands_failed",
+                            status=resp.status_code, body=resp.text[:300])
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram_setmycommands_exception", error=str(e))
 
     async def get_updates(self) -> list[dict]:
         try:
@@ -89,17 +129,25 @@ class TelegramClient:
 
     async def send(self, chat_id: int, text: str) -> None:
         # Telegram max message length is 4096; chunk long replies.
+        # The quick-tap keyboard is attached to the LAST chunk only —
+        # Telegram replaces the keyboard with whatever was on the most
+        # recent message, so attaching to every chunk wastes payload
+        # without changing behaviour.
         chunks = _chunk(text, 3800)
+        last_idx = len(chunks) - 1
         for i, chunk in enumerate(chunks):
+            payload = {
+                "chat_id": chat_id,
+                "text": chunk,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if i == last_idx:
+                payload["reply_markup"] = QUICK_KEYBOARD
             try:
                 resp = await self.session.post(
                     f"{self.base}/sendMessage",
-                    json={
-                        "chat_id": chat_id,
-                        "text": chunk,
-                        "parse_mode": "Markdown",
-                        "disable_web_page_preview": True,
-                    },
+                    json=payload,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("telegram_send_failed", error=str(e), chunk_idx=i)
@@ -108,14 +156,17 @@ class TelegramClient:
                 # Markdown parse failed — retry as plain text so the user sees something.
                 log.warning("telegram_send_markdown_rejected",
                             chunk_idx=i, body=resp.text[:300])
+                fallback_payload = {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": True,
+                }
+                if i == last_idx:
+                    fallback_payload["reply_markup"] = QUICK_KEYBOARD
                 try:
                     fallback = await self.session.post(
                         f"{self.base}/sendMessage",
-                        json={
-                            "chat_id": chat_id,
-                            "text": chunk,
-                            "disable_web_page_preview": True,
-                        },
+                        json=fallback_payload,
                     )
                     if fallback.status_code >= 400:
                         log.error("telegram_send_fallback_failed",
@@ -507,6 +558,11 @@ async def main() -> None:
     pool = await asyncpg.create_pool(db_url, min_size=1, max_size=2)
     tg = TelegramClient(token)
     log.info("audit_bot_starting", chat_id=allowed_chat_id)
+
+    # Register slash commands with Telegram so the `/` autocomplete
+    # menu in the chat shows all available commands with descriptions.
+    # One-shot at startup — Telegram remembers the list per-bot.
+    await tg.register_commands()
 
     # SIGTERM/SIGINT → set the stop event so the poll loop can exit
     # within a heartbeat instead of waiting up to 30s for the current
