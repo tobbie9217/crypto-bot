@@ -29,8 +29,10 @@ import urllib.request
 from datetime import datetime
 from typing import Optional
 
+import pandas as pd
 import psycopg2.extras
 import talib.abstract as ta
+from freqtrade.enums import RunMode
 from freqtrade.persistence import Trade
 from freqtrade.strategy import IStrategy, merge_informative_pair
 from pandas import DataFrame
@@ -199,6 +201,115 @@ class SentimentOnchainStrategy(IStrategy):
             report_db_error("sentiment_lookup", e)
         return (0.0, 0.0, 0)
 
+    # ----------------------- Backtest-mode bulk helpers -----------------------
+    #
+    # In backtest/hyperopt mode the strategy's populate_indicators is called
+    # ONCE per pair with the full historical dataframe. If we used the live
+    # _latest_* helpers there, every historical candle would see the most
+    # recent aggregate value — pure look-ahead bias and the backtest results
+    # would be fiction. Instead we bulk-fetch the whole history for the pair
+    # and time-align it to each candle with pandas merge_asof + a backward
+    # tolerance, so candle `t` only sees aggregates with `bucket_start <= t`.
+
+    def _is_backtest(self) -> bool:
+        try:
+            return self.dp.runmode in (RunMode.BACKTEST, RunMode.HYPEROPT)
+        except Exception:
+            return False
+
+    def _fetch_history_df(self, sql: str, params: tuple) -> Optional[pd.DataFrame]:
+        try:
+            with get_conn() as conn:
+                if conn is None:
+                    return None
+                return pd.read_sql_query(sql, conn, params=params)
+        except Exception as e:  # noqa: BLE001
+            report_db_error(f"history_fetch:{sql.split()[3] if len(sql.split())>3 else 'sql'}", e)
+            return None
+
+    def _merge_sentiment_history(self, dataframe: DataFrame, coin: str) -> DataFrame:
+        """Per-row sentiment for backtest. Fills NaN with zeros so the
+        live-path defaults are preserved."""
+        if dataframe.empty:
+            dataframe["sentiment_mean"] = 0.0
+            dataframe["sentiment_z"] = 0.0
+            dataframe["sentiment_count"] = 0
+            return dataframe
+        start = dataframe["date"].min() - pd.Timedelta(hours=4)
+        end = dataframe["date"].max()
+        history = self._fetch_history_df(
+            """
+            SELECT bucket_start AS date, mean_score, z_score, post_count
+            FROM sentiment_aggregates
+            WHERE coin = %s AND time_window = '1h'
+              AND bucket_start BETWEEN %s AND %s
+            ORDER BY bucket_start
+            """,
+            (coin, start, end),
+        )
+        if history is None or history.empty:
+            dataframe["sentiment_mean"] = 0.0
+            dataframe["sentiment_z"] = 0.0
+            dataframe["sentiment_count"] = 0
+            return dataframe
+        # Freqtrade gives us datetime64[ms, UTC]; psycopg2/pandas read_sql
+        # returns datetime64[us, UTC]. merge_asof requires identical dtype,
+        # so normalise both to milliseconds before merging.
+        history["date"] = pd.to_datetime(history["date"], utc=True).astype("datetime64[ms, UTC]")
+        df = dataframe.sort_values("date").copy()
+        df["date"] = pd.to_datetime(df["date"], utc=True).astype("datetime64[ms, UTC]")
+        merged = pd.merge_asof(
+            df, history, on="date",
+            direction="backward", tolerance=pd.Timedelta(hours=2),
+        )
+        merged["sentiment_mean"] = merged["mean_score"].fillna(0.0)
+        merged["sentiment_z"] = merged["z_score"].fillna(0.0)
+        merged["sentiment_count"] = merged["post_count"].fillna(0).astype(int)
+        return merged.drop(columns=["mean_score", "z_score", "post_count"], errors="ignore")
+
+    def _merge_onchain_history(
+        self,
+        dataframe: DataFrame,
+        coin: str,
+        metric: str,
+        value_col: str,
+        z_col: Optional[str],
+        lookback_hours: int = 6,
+    ) -> DataFrame:
+        """Per-row on-chain value+z for backtest. NaN-fills to None semantics
+        (which translate to numeric defaults at the caller)."""
+        if dataframe.empty:
+            return dataframe
+        start = dataframe["date"].min() - pd.Timedelta(hours=lookback_hours + 1)
+        end = dataframe["date"].max()
+        history = self._fetch_history_df(
+            """
+            SELECT bucket_start AS date, value, z_score
+            FROM onchain_aggregates
+            WHERE coin = %s AND metric = %s AND time_window = '1h'
+              AND bucket_start BETWEEN %s AND %s
+            ORDER BY bucket_start
+            """,
+            (coin, metric, start, end),
+        )
+        if history is None or history.empty:
+            dataframe[value_col] = None
+            if z_col:
+                dataframe[z_col] = None
+            return dataframe
+        history["date"] = pd.to_datetime(history["date"], utc=True).astype("datetime64[ms, UTC]")
+        df = dataframe.sort_values("date").copy()
+        df["date"] = pd.to_datetime(df["date"], utc=True).astype("datetime64[ms, UTC]")
+        merged = pd.merge_asof(
+            df, history, on="date",
+            direction="backward",
+            tolerance=pd.Timedelta(hours=lookback_hours),
+        )
+        merged[value_col] = merged["value"]
+        if z_col:
+            merged[z_col] = merged["z_score"]
+        return merged.drop(columns=["value", "z_score"], errors="ignore")
+
     def _latest_onchain(
         self, coin: str, metric: str
     ) -> tuple[Optional[float], Optional[float]]:
@@ -272,40 +383,50 @@ class SentimentOnchainStrategy(IStrategy):
 
         coin = metadata["pair"].split("/")[0]
 
-        # --- Layer 1: text sentiment ---
-        s_mean, s_z, s_count = self._latest_sentiment(coin)
-        dataframe["sentiment_mean"]  = s_mean
-        dataframe["sentiment_z"]     = s_z
-        dataframe["sentiment_count"] = s_count
+        if self._is_backtest():
+            # ----- Backtest: per-row time-aligned lookups -----
+            dataframe = self._merge_sentiment_history(dataframe, coin)
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "funding_rate", "funding_rate", None, lookback_hours=6)
+            dataframe["funding_available"] = dataframe["funding_rate"].notna().astype(int)
+            dataframe["funding_rate"] = dataframe["funding_rate"].fillna(0.0)
 
-        # --- Layer 2: derivatives ---
-        # Keep the numeric default at 0.0 so exit logic (`funding > 0.001`)
-        # stays False on missing data — we don't want to force-exit when
-        # blind. The `_available` flag is used by the strict entry gate
-        # to refuse new entries when the signal is missing (so a dead
-        # collector can't masquerade as "neutral funding = trade").
-        funding_v, _ = self._latest_onchain(coin, "funding_rate")
-        dataframe["funding_rate"]      = funding_v if funding_v is not None else 0.0
-        dataframe["funding_available"] = 1 if funding_v is not None else 0
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "open_interest", "_oi_v", "oi_z", lookback_hours=6)
+            dataframe["oi_z"] = dataframe["oi_z"].fillna(0.0)
+            dataframe = dataframe.drop(columns=["_oi_v"], errors="ignore")
 
-        _, oi_z = self._latest_onchain(coin, "open_interest")
-        # `oi_z > 0` already blocks strict entries when oi_z defaults to 0,
-        # so no _available column needed here.
-        dataframe["oi_z"] = oi_z if oi_z is not None else 0.0
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "chain_tvl", "_tvl_v", "tvl_z", lookback_hours=24)
+            dataframe["has_tvl_data"] = dataframe["tvl_z"].notna().astype(int)
+            dataframe["tvl_z"] = dataframe["tvl_z"].fillna(0.0)
+            dataframe = dataframe.drop(columns=["_tvl_v"], errors="ignore")
 
-        # --- Layer 3: on-chain & macro ---
-        _, tvl_z = self._latest_onchain(coin, "chain_tvl")
-        # has_tvl_data lets us OR-around the TVL gate for tokens without
-        # a chain (e.g. PEPE, AAVE, RUNE). For chain natives (ETH, SOL,
-        # BNB...) the z-score must be > threshold.
-        dataframe["tvl_z"]         = tvl_z if tvl_z is not None else 0.0
-        dataframe["has_tvl_data"]  = 1 if tvl_z is not None else 0
+            dataframe = self._merge_onchain_history(
+                dataframe, "MARKET", "fear_greed_index", "fng", None, lookback_hours=24)
+            dataframe["fng_available"] = dataframe["fng"].notna().astype(int)
+            dataframe["fng"] = dataframe["fng"].fillna(50.0)
+        else:
+            # ----- Live / dry-run: single latest value, broadcast -----
+            s_mean, s_z, s_count = self._latest_sentiment(coin)
+            dataframe["sentiment_mean"]  = s_mean
+            dataframe["sentiment_z"]     = s_z
+            dataframe["sentiment_count"] = s_count
 
-        # F&G keeps the 50.0 default so exit logic (`fng > 85`) stays
-        # False on missing data. Strict entry gates on `fng_available`.
-        fng_value, _ = self._latest_onchain("MARKET", "fear_greed_index")
-        dataframe["fng"]            = fng_value if fng_value is not None else 50.0
-        dataframe["fng_available"]  = 1 if fng_value is not None else 0
+            funding_v, _ = self._latest_onchain(coin, "funding_rate")
+            dataframe["funding_rate"]      = funding_v if funding_v is not None else 0.0
+            dataframe["funding_available"] = 1 if funding_v is not None else 0
+
+            _, oi_z = self._latest_onchain(coin, "open_interest")
+            dataframe["oi_z"] = oi_z if oi_z is not None else 0.0
+
+            _, tvl_z = self._latest_onchain(coin, "chain_tvl")
+            dataframe["tvl_z"]         = tvl_z if tvl_z is not None else 0.0
+            dataframe["has_tvl_data"]  = 1 if tvl_z is not None else 0
+
+            fng_value, _ = self._latest_onchain("MARKET", "fear_greed_index")
+            dataframe["fng"]            = fng_value if fng_value is not None else 50.0
+            dataframe["fng_available"]  = 1 if fng_value is not None else 0
 
         return dataframe
 
