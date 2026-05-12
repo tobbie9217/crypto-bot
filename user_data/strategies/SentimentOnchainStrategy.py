@@ -130,14 +130,17 @@ class SentimentOnchainStrategy(IStrategy):
     SENTIMENT_FLIP_NEG = -0.1
     RSI_OVERBOUGHT = 80
 
-    # --- Momentum entry path (catches DOGS-style fast pumps) ---
-    # Pure price-action entries that don't require sentiment baseline /
-    # z-scores. Tagged "momentum" so risk hooks below can apply tighter
-    # stops and smaller size.
-    MOMENTUM_PRICE_CHANGE_1H = 8.0      # +8% in last hour
-    MOMENTUM_VOLUME_MULTIPLIER = 3.0    # ≥3× the 24h average volume
-    MOMENTUM_RSI_MAX = 75               # don't chase if already overbought
-    MOMENTUM_CHATTER_COUNT = 30         # alt path: post volume spike
+    # --- Momentum entry path: buy the PULLBACK after a pump, not the pump ---
+    # Backtest of the original "buy on pump in progress" rule produced a
+    # 7.1% win rate over 30 days during a +26% bull market — classic top-
+    # buying. The new rule waits for the pump to happen, then the price
+    # to retrace 2-5% from the recent high before entering.
+    MOMENTUM_PUMP_SIZE_MIN_PCT  = 8.0    # pump of at least +8% in last hour
+    MOMENTUM_PULLBACK_MIN_PCT   = 2.0    # current price down 2%+ from recent high
+    MOMENTUM_PULLBACK_MAX_PCT   = 5.0    # but not more than 5% (not a crash)
+    MOMENTUM_RSI_MAX            = 60    # require RSI to have cooled
+    MOMENTUM_VOLUME_RATIO_MAX   = 2.0   # volume should be normalising
+    MOMENTUM_CHATTER_COUNT      = 30   # alt path: post volume spike
 
     # Risk overrides for momentum-tagged trades
     MOMENTUM_STAKE_FRACTION = 0.30      # 30% of normal position size
@@ -160,7 +163,12 @@ class SentimentOnchainStrategy(IStrategy):
         # Provide 1h candles for every pair in the active whitelist so we
         # can gate entries on the higher-timeframe trend.
         pairs = self.dp.current_whitelist()
-        return [(p, self.informative_timeframe) for p in pairs]
+        out = [(p, self.informative_timeframe) for p in pairs]
+        # BTC 1h is used as a market-regime gate — entries are paused when
+        # BTC's 48-period 1h EMA is below its 200-period 1h EMA.
+        if ("BTC/USDT", "1h") not in out:
+            out.append(("BTC/USDT", "1h"))
+        return out
 
     # ----------------------- DB helpers -----------------------
 
@@ -381,6 +389,45 @@ class SentimentOnchainStrategy(IStrategy):
             dataframe["volume"] / dataframe["volume_ma_24h"]
         ).fillna(1.0)
 
+        # Pump-and-pullback features for the new momentum entry. We look
+        # back 12 candles (1h) for the highest close, compare to the close
+        # 12 candles ago to size the pump, and track how far the current
+        # price has retraced from the recent high.
+        recent_high = dataframe["close"].rolling(window=12).max()
+        price_12_ago = dataframe["close"].shift(12)
+        dataframe["pump_size_pct"] = ((recent_high / price_12_ago) - 1) * 100.0
+        dataframe["pullback_from_high_pct"] = (
+            (recent_high - dataframe["close"]) / recent_high
+        ) * 100.0
+
+        # --- BTC market-regime gate ---
+        # Read BTC 1h candles independently of the trading pair, compute
+        # EMA(48) and EMA(200), and mark each row 1 (uptrend) or 0 (down).
+        # 48 × 1h ≈ 2 days, 200 × 1h ≈ 8 days — slow enough to ignore
+        # intraday chop, fast enough to react to a market turn.
+        btc_1h = self.dp.get_pair_dataframe(pair="BTC/USDT", timeframe="1h")
+        if btc_1h is not None and not btc_1h.empty and len(btc_1h) >= 200:
+            btc_1h = btc_1h.copy()
+            btc_1h["btc_ema_fast"] = ta.EMA(btc_1h, timeperiod=48)
+            btc_1h["btc_ema_slow"] = ta.EMA(btc_1h, timeperiod=200)
+            btc_1h["btc_trend_up"] = (
+                btc_1h["btc_ema_fast"] > btc_1h["btc_ema_slow"]
+            ).astype(int)
+            regime = btc_1h[["date", "btc_trend_up"]].copy()
+            regime["date"] = pd.to_datetime(regime["date"], utc=True).astype("datetime64[ms, UTC]")
+            df = dataframe.sort_values("date").copy()
+            df["date"] = pd.to_datetime(df["date"], utc=True).astype("datetime64[ms, UTC]")
+            dataframe = pd.merge_asof(
+                df, regime, on="date",
+                direction="backward", tolerance=pd.Timedelta(hours=2),
+            )
+            dataframe["btc_trend_up"] = dataframe["btc_trend_up"].fillna(0).astype(int)
+        else:
+            # Not enough BTC history yet — fail closed (no new entries).
+            # 200 × 1h ≈ 8 days warmup; first runs after a fresh start will
+            # see this default until enough BTC data has been collected.
+            dataframe["btc_trend_up"] = 0
+
         coin = metadata["pair"].split("/")[0]
 
         if self._is_backtest():
@@ -436,6 +483,12 @@ class SentimentOnchainStrategy(IStrategy):
         htf_uptrend = dataframe["ema_fast_1h"] > dataframe["ema_slow_1h"]
         htf_not_overbought = dataframe["rsi_1h"] < 75
 
+        # BTC market-regime gate. Applies to BOTH strict and momentum
+        # paths. When BTC's 1h EMA(48) is below EMA(200) (i.e., medium-
+        # term downtrend), no new longs are taken — historically the
+        # single biggest survival fix for momentum strategies.
+        regime_ok = dataframe["btc_trend_up"] == 1
+
         # ----- Strict path: high-conviction, multi-signal confluence -----
         # `funding_available` / `fng_available` gates close the silent-
         # default loophole: previously a dead funding or F&G collector
@@ -459,19 +512,27 @@ class SentimentOnchainStrategy(IStrategy):
             & (dataframe["ema_fast"] > dataframe["ema_slow"])
             & htf_uptrend
             & htf_not_overbought
+            & regime_ok
             & (dataframe["volume"] > 0)
         )
         dataframe.loc[strict, ["enter_long", "enter_tag"]] = (1, "strict")
 
-        # ----- Momentum path: catch fast pumps without sentiment baseline -----
-        # Either a price+volume eruption OR a chatter-volume spike.
-        # 1h must at least be in an uptrend; we skip the rsi_1h gate so we
-        # can still enter when 1h RSI is hot during a real pump.
-        momentum_price = (
-            (dataframe["price_change_1h"] > self.MOMENTUM_PRICE_CHANGE_1H)
-            & (dataframe["volume_ratio"] > self.MOMENTUM_VOLUME_MULTIPLIER)
+        # ----- Momentum path: BUY THE PULLBACK after a pump, not the pump -----
+        # The old rule fired on coin-was-pumping-right-now. Backtest showed
+        # that buys the top: 7.1% win rate over 30 days during a +26%
+        # market. The new rule requires the pump to have already happened
+        # (within the last 12 candles = 1h), and the price to have pulled
+        # back 2-5% from the recent high before we enter. Plus volume
+        # normalising and RSI cooling — i.e., the panic-buying has ended.
+        momentum_pullback = (
+            (dataframe["pump_size_pct"] > self.MOMENTUM_PUMP_SIZE_MIN_PCT)
+            & (dataframe["pullback_from_high_pct"] >= self.MOMENTUM_PULLBACK_MIN_PCT)
+            & (dataframe["pullback_from_high_pct"] <= self.MOMENTUM_PULLBACK_MAX_PCT)
             & (dataframe["rsi"] < self.MOMENTUM_RSI_MAX)
+            & (dataframe["volume_ratio"] < self.MOMENTUM_VOLUME_RATIO_MAX)
+            & (dataframe["close"] > dataframe["ema_slow"])
             & htf_uptrend
+            & regime_ok
             & (dataframe["volume"] > 0)
         )
         momentum_chatter = (
@@ -479,10 +540,11 @@ class SentimentOnchainStrategy(IStrategy):
             & (dataframe["volume_ratio"] > 2.0)
             & (dataframe["rsi"] < self.MOMENTUM_RSI_MAX)
             & htf_uptrend
+            & regime_ok
             & (dataframe["volume"] > 0)
         )
         # Don't double-tag rows already flagged by the strict path.
-        momentum = (momentum_price | momentum_chatter) & (~strict)
+        momentum = (momentum_pullback | momentum_chatter) & (~strict)
         dataframe.loc[momentum, ["enter_long", "enter_tag"]] = (1, "momentum")
 
         # Log every newly-fired entry attempt so we can later see what
