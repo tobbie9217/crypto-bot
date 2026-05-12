@@ -44,11 +44,16 @@
     },
     "pairlists": [
         {
-            "method": "VolumePairList",
+            "method": "CatalystPairList",
             "number_assets": 50,
-            "sort_key": "quoteVolume",
             "min_value": 1000000,
-            "refresh_period": 1800
+            "refresh_period": 1800,
+            "new_listing_hours": 72,
+            "sentiment_lookback_hours": 6,
+            "sentiment_z_min": 1.5,
+            "onchain_lookback_hours": 6,
+            "onchain_z_min": 3.0,
+            "max_extras": 20
         },
         {"method": "AgeFilter", "min_days_listed": 1},
         {"method": "PriceFilter", "low_price_ratio": 0.001},
