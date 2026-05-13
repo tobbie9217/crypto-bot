@@ -75,3 +75,56 @@ class DB:
                 coin, metric, value, source, observed_at, raw_json,
             )
         return row["id"] if row else None
+
+    async def insert_ohlcv_rows(
+        self,
+        rows: list[tuple[
+            str,        # exchange
+            str,        # symbol
+            str,        # coin
+            str,        # timeframe
+            datetime,   # ts
+            float,      # open
+            float,      # high
+            float,      # low
+            float,      # close
+            float,      # volume
+            float | None,  # quote_volume
+            int | None,    # trades
+            float | None,  # taker_buy_base_volume
+            float | None,  # taker_buy_quote_volume
+        ]],
+    ) -> int:
+        """Bulk-insert OHLCV candles. ON CONFLICT updates so an in-progress
+        candle re-inserted on a later cycle overwrites the previous draft.
+
+        Returns the number of rows touched (inserted or updated).
+        """
+        assert self.pool is not None, "DB.connect() not called"
+        if not rows:
+            return 0
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO ohlcv (
+                    exchange, symbol, coin, timeframe, ts,
+                    open, high, low, close, volume,
+                    quote_volume, trades,
+                    taker_buy_base_volume, taker_buy_quote_volume
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                ON CONFLICT (exchange, symbol, timeframe, ts) DO UPDATE SET
+                    open                   = EXCLUDED.open,
+                    high                   = EXCLUDED.high,
+                    low                    = EXCLUDED.low,
+                    close                  = EXCLUDED.close,
+                    volume                 = EXCLUDED.volume,
+                    quote_volume           = EXCLUDED.quote_volume,
+                    trades                 = EXCLUDED.trades,
+                    taker_buy_base_volume  = EXCLUDED.taker_buy_base_volume,
+                    taker_buy_quote_volume = EXCLUDED.taker_buy_quote_volume,
+                    updated_at             = NOW()
+                """,
+                rows,
+            )
+        return len(rows)

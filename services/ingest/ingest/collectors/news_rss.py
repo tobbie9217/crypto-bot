@@ -28,6 +28,10 @@ DEFAULT_FEEDS: tuple[str, ...] = (
     "https://bitcoinmagazine.com/.rss/full/",
     "https://www.theblock.co/rss.xml",
     "https://beincrypto.com/feed/",
+    "https://news.bitcoin.com/feed/",
+    "https://cryptoslate.com/feed/",
+    "https://protos.com/feed/",
+    "https://ambcrypto.com/feed/",
 )
 
 

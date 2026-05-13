@@ -105,6 +105,37 @@ CREATE TABLE IF NOT EXISTS trade_journal (
 CREATE INDEX IF NOT EXISTS idx_journal_pair_time ON trade_journal (pair, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_journal_event     ON trade_journal (event, occurred_at DESC);
 
+-- Historical OHLCV candles stored per (exchange, symbol, timeframe).
+-- Filled by binance_ohlcv collector (current) + backfill_ohlcv script
+-- (history). Primary key is composite so re-inserting an in-progress
+-- candle each cycle is idempotent — the candle row updates in place
+-- until it closes.
+--
+-- `taker_buy_base_volume` / `taker_buy_quote_volume` come straight from
+-- Binance klines and are the buy-side share of the candle's total
+-- volume — useful as a per-candle order-flow feature.
+CREATE TABLE IF NOT EXISTS ohlcv (
+    exchange               TEXT NOT NULL,        -- 'binance_futures'
+    symbol                 TEXT NOT NULL,        -- 'BTCUSDT' (exchange symbol)
+    coin                   TEXT NOT NULL,        -- 'BTC' (base, normalized)
+    timeframe              TEXT NOT NULL,        -- '1m', '5m', '1h'
+    ts                     TIMESTAMPTZ NOT NULL, -- candle open time
+    open                   DOUBLE PRECISION NOT NULL,
+    high                   DOUBLE PRECISION NOT NULL,
+    low                    DOUBLE PRECISION NOT NULL,
+    close                  DOUBLE PRECISION NOT NULL,
+    volume                 DOUBLE PRECISION NOT NULL,
+    quote_volume           DOUBLE PRECISION,
+    trades                 INTEGER,
+    taker_buy_base_volume  DOUBLE PRECISION,
+    taker_buy_quote_volume DOUBLE PRECISION,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (exchange, symbol, timeframe, ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ohlcv_coin_tf_ts
+    ON ohlcv (coin, timeframe, ts DESC);
+
 -- Audit/event log: kill-switch flags, manual pauses, errors, etc.
 CREATE TABLE IF NOT EXISTS bot_events (
     id          BIGSERIAL PRIMARY KEY,

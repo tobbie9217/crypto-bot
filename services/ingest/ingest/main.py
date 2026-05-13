@@ -28,14 +28,19 @@ async def _heartbeat() -> None:
         await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
 from .collectors.binance_derivatives import collect_binance_derivatives
+from .collectors.binance_liquidations import run_binance_liquidations_listener
 from .collectors.binance_listings import collect_binance_listings
+from .collectors.binance_ohlcv import collect_binance_ohlcv
+from .collectors.binance_orderbook import collect_binance_orderbook
 from .collectors.binance_ratios import collect_binance_ratios
 from .collectors.binance_spot import collect_binance_spot
 from .collectors.cryptocompare_news import collect_cryptocompare_news
 from .collectors.cryptopanic import collect_cryptopanic
 from .collectors.defillama import collect_defillama
+from .collectors.defillama_stablecoins import collect_defillama_stablecoins
 from .collectors.fear_greed import collect_fear_greed
 from .collectors.lunarcrush import collect_lunarcrush
+from .collectors.market_volume_ratio import collect_market_volume_ratio
 from .collectors.news_rss import collect_news_rss
 from .collectors.reddit import collect_reddit
 from .collectors.reddit_rss import collect_reddit_rss
@@ -151,6 +156,18 @@ async def main() -> None:
     log.info("scheduled", collector="defillama", interval_s=settings.defillama_interval_s)
 
     scheduler.add_job(
+        safe_run, "interval", seconds=settings.defillama_stablecoins_interval_s,
+        args=["defillama_stablecoins", collect_defillama_stablecoins, db], next_run_time=now,
+    )
+    log.info("scheduled", collector="defillama_stablecoins", interval_s=settings.defillama_stablecoins_interval_s)
+
+    scheduler.add_job(
+        safe_run, "interval", seconds=settings.market_volume_ratio_interval_s,
+        args=["market_volume_ratio", collect_market_volume_ratio, db], next_run_time=now,
+    )
+    log.info("scheduled", collector="market_volume_ratio", interval_s=settings.market_volume_ratio_interval_s)
+
+    scheduler.add_job(
         safe_run, "interval", seconds=settings.binance_derivatives_interval_s,
         args=["binance_derivatives", collect_binance_derivatives, db], next_run_time=now,
     )
@@ -161,6 +178,18 @@ async def main() -> None:
         args=["binance_ratios", collect_binance_ratios, db], next_run_time=now,
     )
     log.info("scheduled", collector="binance_ratios", interval_s=settings.binance_ratios_interval_s)
+
+    scheduler.add_job(
+        safe_run, "interval", seconds=settings.binance_orderbook_interval_s,
+        args=["binance_orderbook", collect_binance_orderbook, db], next_run_time=now,
+    )
+    log.info("scheduled", collector="binance_orderbook", interval_s=settings.binance_orderbook_interval_s)
+
+    scheduler.add_job(
+        safe_run, "interval", seconds=settings.binance_ohlcv_interval_s,
+        args=["binance_ohlcv", collect_binance_ohlcv, db], next_run_time=now,
+    )
+    log.info("scheduled", collector="binance_ohlcv", interval_s=settings.binance_ohlcv_interval_s)
 
     scheduler.add_job(
         safe_run, "interval", seconds=settings.binance_listings_interval_s,
@@ -178,6 +207,10 @@ async def main() -> None:
 
     # Telegram is long-running rather than scheduled — runs as its own task.
     telegram_task = asyncio.create_task(safe_run("telegram", run_telegram_listener, db))
+    # Binance liquidations: public WebSocket, no key. Also long-running.
+    liquidations_task = asyncio.create_task(
+        safe_run("binance_liquidations", run_binance_liquidations_listener, db)
+    )
     heartbeat_task = asyncio.create_task(_heartbeat())
 
     # SIGTERM/SIGINT → set the stop event so we exit the await below
@@ -196,7 +229,7 @@ async def main() -> None:
         await stop_event.wait()
     finally:
         log.info("shutdown_initiated")
-        for task in (telegram_task, heartbeat_task):
+        for task in (telegram_task, liquidations_task, heartbeat_task):
             task.cancel()
             try:
                 await task

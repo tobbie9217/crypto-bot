@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     cryptocompare_news_interval_s: int = 1800   # 30 min — ~50 articles per call
     coingecko_market_interval_s: int = 300      # 5 min — well under free-tier limits
     defillama_interval_s: int = 600             # 10 min
+    defillama_stablecoins_interval_s: int = 1800   # 30 min — supply moves slowly
+    market_volume_ratio_interval_s: int = 1800     # 30 min — DEX vs CEX volume split
 
     # Phase C: derivatives + market-wide signals
     binance_derivatives_interval_s: int = 300   # 5 min — funding + mark + OI
@@ -58,6 +60,8 @@ class Settings(BaseSettings):
     # Binance-native swap-ins (replace CoinGecko market) + new positioning ratios
     binance_spot_interval_s: int = 300          # 5 min — price/volume/24h-change
     binance_ratios_interval_s: int = 600        # 10 min — top/global LSR + taker ratio
+    binance_orderbook_interval_s: int = 300     # 5 min — order-book depth + imbalance
+    binance_ohlcv_interval_s: int = 300         # 5 min — 1m/5m/1h candles per perp
     binance_listings_interval_s: int = 1800     # 30 min — detect new symbol listings
 
     log_level: str = "INFO"

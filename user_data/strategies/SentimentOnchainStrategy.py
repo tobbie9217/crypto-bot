@@ -48,14 +48,25 @@ class SentimentOnchainStrategy(IStrategy):
     # cuts against the 1h trend.
     informative_timeframe = "1h"
 
+    # Tuned to measured trade lengths from 30-day backtest: winners last
+    # ~23 min and gain ~1% on average. Previous ladder (1%/2%/3%/5%) was
+    # too patient — let winners run into losers too often. New rule: take
+    # very-small-profit exit aggressively after 30 min, give big winners
+    # ~15 min of runway, gate immediate exits at 5%+ to catch moonshots.
+    # freqtrade picks the latest key whose time has elapsed, so this
+    # ladder relaxes (lower required profit) the longer the trade is held.
     minimal_roi = {
-        "120": 0.01,
-        "60": 0.02,
-        "30": 0.03,
-        "0": 0.05,
+        "120": 0.0,     # after 2h: any profit at all (time-based exit)
+        "30":  0.008,   # after 30m: 0.8% is enough (lock the win)
+        "15":  0.015,   # after 15m: 1.5% (matches measured avg winner)
+        "0":   0.05,    # immediately: only on 5%+ (catch the moonshot)
     }
 
-    stoploss = -0.03
+    # Class-level stop is a SAFETY NET — custom_stoploss below overrides
+    # it per-trade with an ATR-scaled value. This -0.08 matches the
+    # ATR_STOP_MAX_PCT cap and ensures freqtrade never lets a trade run
+    # past that even if the dataframe lookup fails.
+    stoploss = -0.08
 
     trailing_stop = True
     trailing_stop_positive = 0.01
@@ -125,6 +136,22 @@ class SentimentOnchainStrategy(IStrategy):
     # Market-wide
     FNG_MAX_ENTER = 75              # don't buy into "Extreme Greed"
     FNG_MAX_EXIT  = 85              # exit on "Extreme Greed"
+
+    # Order-flow soft gates — block entries only when the signal is
+    # *available* AND *clearly bearish*. Mirrors the funding/fng _available
+    # pattern: missing data never blocks a trade. See deep_research.pdf
+    # part 1 — these three signals were being collected but ignored.
+    TOP_TRADER_LSR_MIN  = 0.7       # below 0.7 = top traders net-short
+    TAKER_BUY_SELL_MIN  = 0.85      # below 0.85 = aggressive sellers winning
+
+    # ATR-based stop-loss tuning. Replaces the old "fixed 3%" stop the
+    # deep-research audit flagged as wrong for varying-volatility coins.
+    # stop_pct = clamp(atr_pct * mult, [min_pct, max_pct])
+    #   - Volatile alts (atr_pct ~5%) get ~7.5% stops (clamped to max)
+    #   - Stable majors (atr_pct ~1%) get tighter ~1.5% stops (clamped to min)
+    ATR_STOP_MULT     = 1.5
+    ATR_STOP_MIN_PCT  = 1.5         # never tighter than this (~normal-coin noise)
+    ATR_STOP_MAX_PCT  = 8.0         # never wider than this (capital protection cap)
 
     # Exits
     SENTIMENT_FLIP_NEG = -0.1
@@ -355,8 +382,41 @@ class SentimentOnchainStrategy(IStrategy):
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["rsi"] = ta.RSI(dataframe, timeperiod=14)
-        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=12)
+        # Fast EMA bumped 12 -> 21 (deep_research.pdf part 2): EMA(12)/EMA(50)
+        # on 5m is whipsaw-prone; 21/55-style setups are the textbook pro
+        # default. Keeping slow at 50 so only one variable changes per
+        # backtest cycle for clean attribution.
+        dataframe["ema_fast"] = ta.EMA(dataframe, timeperiod=21)
         dataframe["ema_slow"] = ta.EMA(dataframe, timeperiod=50)
+
+        # ATR(14) for volatility-scaled stops + per-row volatility feature.
+        # atr_pct = ATR as a percentage of price — comparable across coins
+        # priced from $0.0001 (PEPE) to $60,000+ (BTC).
+        dataframe["atr"] = ta.ATR(dataframe, timeperiod=14)
+        dataframe["atr_pct"] = (dataframe["atr"] / dataframe["close"]) * 100.0
+
+        # Bollinger Bands (20-period SMA ± 2 std). Stored as features for
+        # post-hoc analysis — the deep-research audit called BB "medium-
+        # high value" for pullback-style strategies because it gives a
+        # volatility-aware "how stretched is price" signal. NOT yet wired
+        # into entry rules; we want to see in the trade journal whether
+        # "entered near lower band" correlates with win rate before
+        # adding a hard gate.
+        #
+        # bb_pct_b = (close - lower) / (upper - lower)
+        #   0.0 = price sitting on lower band  (oversold)
+        #   0.5 = price at middle band
+        #   1.0 = price sitting on upper band  (overbought)
+        bb_basis = dataframe["close"].rolling(window=20, min_periods=20).mean()
+        bb_std = dataframe["close"].rolling(window=20, min_periods=20).std()
+        dataframe["bb_middle"] = bb_basis
+        dataframe["bb_upper"] = bb_basis + (bb_std * 2.0)
+        dataframe["bb_lower"] = bb_basis - (bb_std * 2.0)
+        bb_range = dataframe["bb_upper"] - dataframe["bb_lower"]
+        # Guard against the warmup window where range is 0/NaN.
+        dataframe["bb_pct_b"] = (
+            (dataframe["close"] - dataframe["bb_lower"]) / bb_range.where(bb_range > 0)
+        ).clip(lower=-0.5, upper=1.5)
 
         # --- 1h informative timeframe (trend gate) ---
         # Forward-filled into each 5m row so we can reference the most-
@@ -366,7 +426,9 @@ class SentimentOnchainStrategy(IStrategy):
         )
         if not informative.empty:
             informative["rsi"] = ta.RSI(informative, timeperiod=14)
-            informative["ema_fast"] = ta.EMA(informative, timeperiod=12)
+            # Matches the 5m fast period (21) so the cross signal is
+            # internally consistent across both timeframes.
+            informative["ema_fast"] = ta.EMA(informative, timeperiod=21)
             informative["ema_slow"] = ta.EMA(informative, timeperiod=50)
             dataframe = merge_informative_pair(
                 dataframe, informative,
@@ -453,6 +515,25 @@ class SentimentOnchainStrategy(IStrategy):
                 dataframe, "MARKET", "fear_greed_index", "fng", None, lookback_hours=24)
             dataframe["fng_available"] = dataframe["fng"].notna().astype(int)
             dataframe["fng"] = dataframe["fng"].fillna(50.0)
+
+            # --- Order-flow signals (LSR + taker buy/sell ratio) ---
+            # 1.0 is the "neutral" default (longs == shorts, buys == sells),
+            # so missing data won't bias either way. The _available flag is
+            # what the soft gate keys off.
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "top_trader_lsr", "top_trader_lsr", None, lookback_hours=6)
+            dataframe["top_trader_lsr_available"] = dataframe["top_trader_lsr"].notna().astype(int)
+            dataframe["top_trader_lsr"] = dataframe["top_trader_lsr"].fillna(1.0)
+
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "global_account_lsr", "global_account_lsr", None, lookback_hours=6)
+            dataframe["global_account_lsr_available"] = dataframe["global_account_lsr"].notna().astype(int)
+            dataframe["global_account_lsr"] = dataframe["global_account_lsr"].fillna(1.0)
+
+            dataframe = self._merge_onchain_history(
+                dataframe, coin, "taker_buy_sell_ratio", "taker_buy_sell_ratio", None, lookback_hours=6)
+            dataframe["taker_buy_sell_available"] = dataframe["taker_buy_sell_ratio"].notna().astype(int)
+            dataframe["taker_buy_sell_ratio"] = dataframe["taker_buy_sell_ratio"].fillna(1.0)
         else:
             # ----- Live / dry-run: single latest value, broadcast -----
             s_mean, s_z, s_count = self._latest_sentiment(coin)
@@ -475,6 +556,26 @@ class SentimentOnchainStrategy(IStrategy):
             dataframe["fng"]            = fng_value if fng_value is not None else 50.0
             dataframe["fng_available"]  = 1 if fng_value is not None else 0
 
+            # --- Order-flow signals (LSR + taker buy/sell ratio) ---
+            top_lsr_v, _ = self._latest_onchain(coin, "top_trader_lsr")
+            dataframe["top_trader_lsr"]            = top_lsr_v if top_lsr_v is not None else 1.0
+            dataframe["top_trader_lsr_available"]  = 1 if top_lsr_v is not None else 0
+
+            global_lsr_v, _ = self._latest_onchain(coin, "global_account_lsr")
+            dataframe["global_account_lsr"]            = global_lsr_v if global_lsr_v is not None else 1.0
+            dataframe["global_account_lsr_available"]  = 1 if global_lsr_v is not None else 0
+
+            taker_v, _ = self._latest_onchain(coin, "taker_buy_sell_ratio")
+            dataframe["taker_buy_sell_ratio"]    = taker_v if taker_v is not None else 1.0
+            dataframe["taker_buy_sell_available"] = 1 if taker_v is not None else 0
+
+        # Smart-money vs retail divergence — positive = top traders more long
+        # than retail (a textbook smart-money lead signal). Falls out to 0
+        # when both default to 1.0 (no data).
+        dataframe["smart_money_divergence"] = (
+            dataframe["top_trader_lsr"] - dataframe["global_account_lsr"]
+        )
+
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -488,6 +589,18 @@ class SentimentOnchainStrategy(IStrategy):
         # term downtrend), no new longs are taken — historically the
         # single biggest survival fix for momentum strategies.
         regime_ok = dataframe["btc_trend_up"] == 1
+
+        # Order-flow soft gates — same _available pattern as funding/fng.
+        # Blocks an entry only when the signal is *present* and *clearly
+        # bearish*; missing data = trade allowed.
+        top_trader_ok = (
+            (dataframe["top_trader_lsr_available"] == 0)
+            | (dataframe["top_trader_lsr"] >= self.TOP_TRADER_LSR_MIN)
+        )
+        taker_buy_ok = (
+            (dataframe["taker_buy_sell_available"] == 0)
+            | (dataframe["taker_buy_sell_ratio"] >= self.TAKER_BUY_SELL_MIN)
+        )
 
         # ----- Strict path: high-conviction, multi-signal confluence -----
         # `funding_available` / `fng_available` gates close the silent-
@@ -513,6 +626,8 @@ class SentimentOnchainStrategy(IStrategy):
             & htf_uptrend
             & htf_not_overbought
             & regime_ok
+            & top_trader_ok
+            & taker_buy_ok
             & (dataframe["volume"] > 0)
         )
         dataframe.loc[strict, ["enter_long", "enter_tag"]] = (1, "strict")
@@ -533,6 +648,8 @@ class SentimentOnchainStrategy(IStrategy):
             & (dataframe["close"] > dataframe["ema_slow"])
             & htf_uptrend
             & regime_ok
+            & top_trader_ok
+            & taker_buy_ok
             & (dataframe["volume"] > 0)
         )
         momentum_chatter = (
@@ -541,6 +658,8 @@ class SentimentOnchainStrategy(IStrategy):
             & (dataframe["rsi"] < self.MOMENTUM_RSI_MAX)
             & htf_uptrend
             & regime_ok
+            & top_trader_ok
+            & taker_buy_ok
             & (dataframe["volume"] > 0)
         )
         # Don't double-tag rows already flagged by the strict path.
@@ -624,6 +743,35 @@ class SentimentOnchainStrategy(IStrategy):
             return max(min_stake or 0, proposed_stake * self.MOMENTUM_STAKE_FRACTION)
         return proposed_stake
 
+    def _atr_stop_for_pair(self, pair: str) -> Optional[float]:
+        """Look up the latest ATR% for `pair` and turn it into a stop ratio.
+
+        Returns the stop as a negative float (e.g. -0.025 = 2.5% below
+        entry), or None if we can't read ATR (caller falls back to the
+        class-level stoploss, which is set wide enough to absorb that
+        worst case).
+        """
+        try:
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        except Exception:
+            return None
+        if df is None or df.empty or "atr_pct" not in df.columns:
+            return None
+        try:
+            atr_pct = float(df["atr_pct"].iloc[-1])
+        except (TypeError, ValueError, KeyError):
+            return None
+        if not (atr_pct > 0):
+            return None
+        # Clamp into [min, max] so a freshly-listed/illiquid coin doesn't
+        # produce a 0.1% stop (insta-stop on a normal wick) or a 30% stop
+        # (capital wipeout on a real crash).
+        stop_pct = max(
+            self.ATR_STOP_MIN_PCT,
+            min(self.ATR_STOP_MAX_PCT, atr_pct * self.ATR_STOP_MULT),
+        )
+        return -stop_pct / 100.0
+
     def custom_stoploss(
         self,
         pair: str,
@@ -634,18 +782,21 @@ class SentimentOnchainStrategy(IStrategy):
         after_fill: bool,
         **kwargs,
     ) -> Optional[float]:
-        # Strict trades use the class-level stoploss + trailing config.
-        if trade.enter_tag != "momentum":
-            return None
-        # Momentum trades: tighter trailing once in profit, hard 3% stop
-        # otherwise. Returning a positive number relative to current price
-        # would be wrong; we return a negative ratio off entry.
-        if current_profit > 0.02:
-            # Trail at ~1% behind highest profit. Approximate by setting
-            # the stop at current_profit - 0.01 (so each new high tightens
-            # the stop).
+        # Momentum trades: keep the tight trailing-stop behaviour once
+        # comfortably in profit — that's where the moonshot wins live.
+        if trade.enter_tag == "momentum" and current_profit > 0.02:
             return current_profit - self.MOMENTUM_TRAILING_STOP
-        return self.MOMENTUM_HARD_STOP
+
+        # Default: ATR-scaled hard stop for BOTH paths. The deep-research
+        # audit flagged the old fixed -3%/-3% pairing as wrong for varying
+        # volatility — a 3% stop on BTC (daily ATR ~2%) is reasonable, a
+        # 3% stop on a meme coin (daily ATR ~10%) is just noise.
+        atr_stop = self._atr_stop_for_pair(pair)
+        if atr_stop is not None:
+            return atr_stop
+        # Dataframe lookup failed — fall through to the class-level
+        # stoploss (set to -0.08 = ATR_STOP_MAX_PCT) as the safety net.
+        return None
 
     # ----------------------- Trade journal -----------------------
 
@@ -654,11 +805,17 @@ class SentimentOnchainStrategy(IStrategy):
     _SNAPSHOT_COLUMNS: tuple[str, ...] = (
         "close", "rsi", "ema_fast", "ema_slow",
         "rsi_1h", "ema_fast_1h", "ema_slow_1h",
+        "atr", "atr_pct",
+        "bb_upper", "bb_middle", "bb_lower", "bb_pct_b",
         "sentiment_mean", "sentiment_z", "sentiment_count",
         "funding_rate", "funding_available",
         "oi_z", "tvl_z", "has_tvl_data",
         "fng", "fng_available",
         "price_change_1h", "volume_ratio",
+        "top_trader_lsr", "top_trader_lsr_available",
+        "global_account_lsr", "global_account_lsr_available",
+        "taker_buy_sell_ratio", "taker_buy_sell_available",
+        "smart_money_divergence",
     )
 
     def _snapshot_features(self, pair: str) -> dict:
@@ -739,9 +896,16 @@ class SentimentOnchainStrategy(IStrategy):
             "FNG_MAX_EXIT":              self.FNG_MAX_EXIT,
             "SENTIMENT_FLIP_NEG":        self.SENTIMENT_FLIP_NEG,
             "RSI_OVERBOUGHT":            self.RSI_OVERBOUGHT,
-            "MOMENTUM_PRICE_CHANGE_1H":  self.MOMENTUM_PRICE_CHANGE_1H,
-            "MOMENTUM_VOLUME_MULTIPLIER":self.MOMENTUM_VOLUME_MULTIPLIER,
+            "TOP_TRADER_LSR_MIN":        self.TOP_TRADER_LSR_MIN,
+            "TAKER_BUY_SELL_MIN":        self.TAKER_BUY_SELL_MIN,
+            "ATR_STOP_MULT":             self.ATR_STOP_MULT,
+            "ATR_STOP_MIN_PCT":          self.ATR_STOP_MIN_PCT,
+            "ATR_STOP_MAX_PCT":          self.ATR_STOP_MAX_PCT,
+            "MOMENTUM_PUMP_SIZE_MIN_PCT": self.MOMENTUM_PUMP_SIZE_MIN_PCT,
+            "MOMENTUM_PULLBACK_MIN_PCT": self.MOMENTUM_PULLBACK_MIN_PCT,
+            "MOMENTUM_PULLBACK_MAX_PCT": self.MOMENTUM_PULLBACK_MAX_PCT,
             "MOMENTUM_RSI_MAX":          self.MOMENTUM_RSI_MAX,
+            "MOMENTUM_VOLUME_RATIO_MAX": self.MOMENTUM_VOLUME_RATIO_MAX,
             "MOMENTUM_CHATTER_COUNT":    self.MOMENTUM_CHATTER_COUNT,
             "MOMENTUM_STAKE_FRACTION":   self.MOMENTUM_STAKE_FRACTION,
             "MOMENTUM_TRAILING_STOP":    self.MOMENTUM_TRAILING_STOP,
