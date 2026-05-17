@@ -68,6 +68,10 @@ class SentimentOnchainStrategy(IStrategy):
     # past that even if the dataframe lookup fails.
     stoploss = -0.08
 
+    # 2026-05-17 diagnostic confirmed trailing stop is not the bug.
+    # Tested 1%/2% (PF 0.45), 2%/3% (PF 0.36), disabled (similar) — entry
+    # logic lacks edge over 90 days regardless. Kept at 1%/2% (least-bad
+    # variant); real fix has to come from the entry side.
     trailing_stop = True
     trailing_stop_positive = 0.01
     trailing_stop_positive_offset = 0.02
@@ -162,6 +166,10 @@ class SentimentOnchainStrategy(IStrategy):
     # 7.1% win rate over 30 days during a +26% bull market — classic top-
     # buying. The new rule waits for the pump to happen, then the price
     # to retrace 2-5% from the recent high before entering.
+    # Tried loosening to 5/1/7 (2026-05-13 Tier A rec) — 29 trades but
+    # PF dropped 1.48 → 0.94 and net flipped +$2 → -$2. Reverted: lower-
+    # conviction pumps don't have follow-through; the strict gate is the
+    # edge. See work_log 2026-05-17 entry.
     MOMENTUM_PUMP_SIZE_MIN_PCT  = 8.0    # pump of at least +8% in last hour
     MOMENTUM_PULLBACK_MIN_PCT   = 2.0    # current price down 2%+ from recent high
     MOMENTUM_PULLBACK_MAX_PCT   = 5.0    # but not more than 5% (not a crash)

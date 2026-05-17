@@ -1,0 +1,433 @@
+Deep research: data quality, strategy quality, and
+the futures question
+
+Generated 2026-05-12. Source: full audit of services/ingest/ingest/collectors/,
+user_data/strategies/SentimentOnchainStrategy.py, and live Postgres queries against the
+running stack.
+
+Methodology
+
+Every claim about the bot is grounded in a file I read or a query I ran. Claims about general trading
+practice based on training (not measurement) are marked [opinion]. No fabricated numbers.
+
+PART 1 -- Data: what the bot actually sees today
+
+1.1 Per-coin metrics flowing in (last 24h, verified)
+
+Metric                Rows / 24h
+price_usd             93,976
+volume_24h            93,975
+price_change_24h      93,974
+funding_rate          79,525
+mark_price            79,525
+open_interest         77,950
+top_trader_lsr        8,098
+global_account_lsr    8,095
+taker_buy_sell_ratio  7,935
+chain_tvl         1,232
+fear_greed_index  1
+
+Source breakdown by file:
+
+· binance_spot.py  /api/v3/ticker/24hr once per cycle  price_usd, volume_24h,
+    price_change_24h
+
+· binance_derivatives.py  /fapi/v1/premiumIndex + per-symbol /fapi/v1/openInterest 
+    funding_rate, mark_price, open_interest
+
+· binance_ratios.py  three endpoints (topLongShortAccountRatio,
+    globalLongShortAccountRatio, takerlongshortRatio)
+
+· defillama.py  /v2/chains  chain_tvl for 18 chains
+· fear_greed.py  alternative.me  fear_greed_index
+
+1.2 Text / sentiment sources (verified)
+
+· news_rss.py -- six RSS feeds: CoinDesk, CoinTelegraph, Decrypt, BitcoinMagazine, TheBlock,
+    BeInCrypto
+
+· reddit_rss.py -- public RSS from configured subreddits (cryptocurrency, bitcoin,
+    cryptomarkets)
+
+· reddit.py -- asyncpraw, only runs if credentials present (currently disabled)
+· cryptocompare_news.py -- public news endpoint
+· cryptopanic.py -- only runs if token set (currently disabled)
+· lunarcrush.py -- only runs if token set (currently disabled)
+· telegram_channels.py -- seven public channels: CoinDesk, WhaleAlert, CryptoCurrencyNews,
+
+    CoinTelegraph, intothecryptoverse_news, CoinMarketCap, SplexCrypto_News
+
+All text flows into posts, CryptoBERT scores it into sentiment_scores, the aggregator rolls those into
+1h sentiment_aggregates.
+
+1.3 What the strategy actually consumes
+
+SentimentOnchainStrategy.py reads these per-row features:
+From OHLCV (delivered by freqtrade/CCXT, not by ingest): close, high, low, open, volume.
+From Postgres aggregates:
+· sentiment_mean, sentiment_z, sentiment_count
+· funding_rate, funding_available
+· oi_z
+· tvl_z, has_tvl_data
+· fng, fng_available
+· btc_trend_up (computed from BTC 1h OHLCV)
+
+Critical finding: Of the eleven metric types collected, the strategy uses only five. The rest is dead data:
+
+Collected                                       Used by strategy?
+
+price_usd (Binance ticker)                      No -- strategy uses OHLCV from CCXT instead
+
+volume_24h                                      No
+price_change_24h                                No -- strategy computes its own 1h change
+
+mark_price                                      No
+
+top_trader_lsr                                  Partial -- only in _momentum_veto_reason (soft
+global_account_lsr                              veto), never in entry rules
+
+                                                No -- never queried
+
+taker_buy_sell_ratio                            No -- never queried
+
+That is three valuable signals (top-trader LSR, retail LSR, taker buy/sell ratio) being collected at
+roughly 24,000 rows per day and ignored.
+
+1.4 What's NOT collected that crypto traders typically use
+
+These are things I checked and confirmed are not collected. [opinion] on value:
+
+Data                         Cost                   Value
+                             Free (Binance REST)
+Order-book depth (bids/asks                         High. Detects whale walls and
+within 1% of mid)                                   absorption. Single biggest
+                                                    missing piece for short-term
+                                                    entries.
+Liquidations data (Binance      Free (websocket) or Coinglass    High. Big liquidation cascades
+forced-close feed)              Glassnode paid / Etherscan free  mark capitulation lows and
+                                                                 blow-off tops.
+Exchange netflow (coins moving
+in/out of Binance)                                               Medium. Inflows often precede
+                                                                 selling.
+
+Stablecoin supply / movements   DefiLlama free / Glassnode       Medium. USDT minting often
+                                                                 precedes broad rallies.
+Whale wallet flows (top-100     Etherscan / Arkham (paid)
+holders)                                                         Medium-high.
+
+Token unlock schedules          TokenUnlocks.app free            Medium. Coins about to unlock
+                                                                 supply often dump.
+
+DEX vs CEX volume ratio         DefiLlama free                   Low-medium. Useful for
+X/Twitter firehose              Paid ($100+/mo)                  memes/long-tail.
+
+                                                                 Medium. Mostly noise but does
+                                                                 lead price.
+
+Alpha Telegram/Discord groups   Manual curation                  Medium. Quality varies wildly.
+                                Free
+Real OHLCV stored                                                High. Currently freqtrade
+(multi-timeframe, all pairs)                                     re-downloads on every backtest.
+
+Funding rate predictions        Calc from premium index          Medium. Already collected raw;
+                                                                 not pre-computed forward.
+
+Conclusion on data quality: The bot has a strong foundation (free APIs, broad coverage, real-time).
+The most actionable gaps are (1) using the LSR ratios already being collected, (2) adding
+order-book depth, and (3) adding Binance liquidations feed. Everything else is incremental.
+
+PART 2 -- Indicators: what the strategy actually
+computes
+
+2.1 The complete TA indicator inventory
+
+Every ta.* call in the strategy file:
+   ta.RSI(dataframe, timeperiod=14) # 5m RSI ta.EMA(dataframe, timeperiod=12) # 5m
+   fast EMA ta.EMA(dataframe, timeperiod=50) # 5m slow EMA ta.RSI(informative,
+   timeperiod=14) # 1h RSI ta.EMA(informative, timeperiod=12) # 1h fast EMA
+   ta.EMA(informative, timeperiod=50) # 1h slow EMA ta.EMA(btc_1h, timeperiod=48) #
+   BTC 1h regime fast ta.EMA(btc_1h, timeperiod=200) # BTC 1h regime slow
+
+Total: two unique indicators (RSI, EMA). Everything else (pump_size_pct, volume_ratio,
+pullback_from_high_pct, sentiment_z, oi_z, etc.) is computed by hand from OHLCV or from DB lookups.
+
+2.2 What common technical indicators are missing
+
+[opinion] on each:
+
+Indicator                         What it tells you                 Likely value here
+MACD                              Trend reversal momentum
+Bollinger Bands                   Volatility bands, mean reversion  Low-medium -- overlaps with
+                                                                    EMA crosses
+ATR (Average True Range)          Volatility
+                                                                    Medium-high -- would identify
+VWAP                              Volume-weighted price             "pulled back to lower band"
+Stochastic RSI                    benchmark                         entries
+OBV (On-Balance Volume)           More sensitive momentum
+Pivot points / S/R levels         Volume-flow direction             High -- could replace fixed 3%
+Market structure (HH/HL/LL/LH)    Where buyers/sellers act          stop-loss with volatility-scaled
+                                  Trend state                       stops
+Candlestick patterns (engulfing,
+pin bar)                          Reversal signals                  Medium -- useful for intraday
+Heikin Ashi                       Smoothed trend visualization      bias
+
+                                                                    Low -- duplicates RSI signal
+
+                                                                    Medium
+
+                                                                    High -- pullback strategies
+                                                                    benefit hugely from context
+
+                                                                    High -- distinguishes pullback in
+                                                                    uptrend from failed bounce in
+                                                                    downtrend
+
+                                                                    Low-medium
+
+                                                                    Low
+2.3 What's specifically wrong with the current indicator set
+
+Concrete observations:
+    Fixed 3% stop-loss for everything (stoploss = -0.03). A 3% stop on BTC (daily ATR ~2%) is
+    reasonable. A 3% stop on a meme coin (daily ATR ~10%) is noise -- you'll get stopped out on
+    normal wiggle. ATR-based stops would help materially [opinion].
+    EMA(12)/EMA(50) on 5m is sensitive to noise. Whipsaw is constant. Most pro setups use
+    EMA(20)/EMA(50) or EMA(21)/EMA(55) [opinion].
+    The "1h informative" timeframe is the only multi-timeframe context. No daily or weekly trend.
+    The BTC regime gate is the first piece of cross-pair context the strategy has, added today.
+    No price-relative-to-level features. "How far from yesterday's high?" or "is current price above the
+    prior weekly close?" -- simple, free, and absent.
+
+2.4 The "rule-based vs ML" question
+
+The bot is 100% rule-based. CryptoBERT scores sentiment but does not predict price. [opinion]: ML for
+crypto price prediction is hard and overrated -- most retail-built ML bots fail because the signal-to-noise
+ratio is low and the data quality bar is high. The features the strategy already computes are exactly the
+kind of inputs that would feed a lightweight model (e.g. LightGBM). But you should not put ML on top of
+an unproven strategy -- first prove the rules work, then add ML to extract more juice. Doing it the other
+way is "we don't know which inputs matter, let's hope the algorithm figures it out", and it doesn't.
+
+PART 3 -- Strategy quality
+
+3.1 What kind of strategy is this?
+
+After v2 changes:
+· Family: Momentum-pullback ("buy the dip after a breakout")
+· Timeframe: 5m trades, average hold 18 minutes in backtest
+· Edge hypothesis: Coins that pump and then briefly retrace tend to continue if the pullback is shallow
+· Regime gate: Don't trade in a BTC downtrend (medium-term)
+
+This is a reasonable, well-understood strategy family. Many professional discretionary traders use it. It's
+not exotic, which is good -- exotic strategies typically don't survive after fees.
+3.2 What measured v2 actually does
+
+From the 30-day backtest:
+
+   5 trades | 3W / 2L | 60% win rate Net P&L: +$0.35 on $10,000 (0.003%) Best:
+   CHIP/USDT +3.12% Worst: SAGA/USDT -3.01% Profit factor: ~1.05 Drawdown: 0.05%
+
+Measured edge: ~+0.05% per trade. That's the actual statistical edge over 30 days.
+
+3.3 The "is this the best strategy?" question, honestly
+
+[opinion] Short answer: it's a reasonable strategy family but currently a fragile prototype.
+Strengths:
+· Multi-source feature set (price + sentiment + on-chain + regime)
+· Pullback entry is statistically more robust than chasing breakouts
+· Regime gate prevents bear-market disasters
+· Position-sizing discipline (fixed $500 / 3 max)
+
+Weaknesses:
+· Trade frequency too low -- 5 trades / 30 days won't compound
+· Win:loss ratio less than 1 -- avg winner is smaller than avg loser
+· One-size-fits-all stop-loss -- 3% on every coin regardless of volatility
+· Strict path is dead -- 0 trades fired over a month
+· No daily/weekly context -- operates entirely on 5m + 1h
+· Single direction -- long-only, can't profit from down-moves
+
+3.4 Alternative strategy families worth knowing about
+
+[opinion] -- retail crypto strategy taxonomy:
+1. Trend-following on higher timeframes (1h­4h) -- buy higher highs in confirmed uptrend, exit on
+
+    trend break. Long holds. Simple. Robust. Few-times-a-month with big winners.
+2. Mean reversion in range markets -- buy oversold (RSI<20, lower Bollinger), sell overbought.
+
+    Works in chop, blows up in trending moves. Needs regime filter.
+3. Pullback in trend (this bot) -- buy dips in confirmed uptrend. Medium frequency.
+4. Breakout -- buy when price crosses a multi-day high. High false-positive rate; needs strong filters.
+5. Cross-exchange arbitrage -- capture price differences between Binance and other venues.
+    Capital-intensive but low-risk.
+
+6. Funding rate arbitrage (futures-only) -- short the perp when funding is extreme positive, hold spot.
+    Market-neutral. Real edge but small per trade.
+
+7. Event/news trading -- fire on specific catalysts. The catalyst-pairlist work is the foundation for this.
+
+The current pullback strategy is in family #3. The closest pivot that might add edge without changing the
+family is to also look for breakouts of consolidation ranges (family #4) when the regime is bullish.
+
+PART 4 -- Futures and shorts: the honest
+economic analysis
+
+4.1 Cost structure differences (current Binance rates)
+
+Cost          Binance Spot          Binance USDs Futures
+
+Maker fee     0.1% (0.075% w/ BNB)  0.02% (0.018% w/ BNB)
+Taker fee     0.1% (0.075% w/ BNB)  0.04% (0.036% w/ BNB)
+
+Funding rate  N/A                   Paid every 8h, range: typically
+                                    -0.075% to +0.1% per period
+Borrow cost   N/A
+                                    Built into funding
+
+Futures fees are actually lower than spot. The friction is the funding rate, paid every 8 hours by longs
+(when positive) or shorts (when negative). In a strong bull market, longs can pay 0.05­0.1% per 8h =
+0.15­0.3% per day just to hold. For a strategy holding 18 minutes on average, funding is irrelevant --
+you never see a funding event.
+
+4.2 The killer math for the current strategy on futures
+
+Round-trip cost of one trade:
+· Spot taker: 0.075% × 2 = 0.15% per trade
+· Futures taker: 0.036% × 2 = 0.072% per trade
+· Plus typical slippage: ~0.05% [opinion]
+
+Total round-trip friction:
+· Spot: ~0.20%
+· Futures: ~0.12%
+
+Current strategy's average winning trade: ~1.04%. Average losing trade: ~-2.02%. Net per trade:
++0.05%.
+
+   Spot                     Futures (1×)   Futures (3×)         Futures (10×)
+                            +0.05%         +0.15% on stake      +0.50% on stake
+Str+at0e.g0y5%
+edge                        -0.12%         -0.36%               -1.20%
+per                         -0.07%         -0.21%               -0.70%
+trade
+
+Ro-u0n.d2-0t%rip
+cost
+
+Ne-t0.15%
+per
+trade
+
+Critical finding: the current strategy's edge is below the round-trip cost on spot -- meaning the "+$0.35
+over 30 days" backtest result assumed paper-trading without realistic slippage. In the real world the
+strategy may already be slightly negative.
+
+Switching to futures at any leverage with the current strategy = guaranteed loss.
+
+4.3 Liquidation risk at common leverage levels
+
+Approximation (ignoring small maintenance-margin adjustments):
+· 1× leverage: no liquidation risk (same as spot)
+· 2× leverage: liquidated at ~50% adverse move
+· 3× leverage: liquidated at ~33% adverse move
+· 5× leverage: liquidated at ~20% adverse move
+· 10× leverage: liquidated at ~10% adverse move
+· 20× leverage: liquidated at ~5% adverse move
+[opinion] Crypto sees 10­20% single-day moves routinely. Luna: -99% in 3 days. FTX: -90% in 48h.
+Anything above 3× leverage on a single position is gambling, not trading. For a momentum strategy with
+3% hard stops, 2­3× leverage is the practical max -- and even that requires the stop-loss to never slip
+during a fast move.
+
+4.4 Do shorts work in crypto historically?
+
+[opinion]:
+· Bull markets: shorts are graveyards. Coins that "look done" can melt up another 100%.
+· Bear markets: shorts work, but the easy short trades happen in the first 30% of the drawdown -- by
+
+    the time most people recognize "we're in a bear", the easy money is gone.
+· Ranging markets: short the resistance, long the support. Mean-reversion shorts. Bot-friendly.
+· Single-event shorts: token unlocks, security exploits, exchange depegs. High edge if you're early;
+
+    impossible to scale because they're rare.
+· Funding-rate shorts: when perp funding is extreme positive, short and earn the funding while you're
+
+    correct on direction. Real market-neutral edge.
+
+The bot's current regime gate gives a partial answer to "long or short": when BTC EMA48 < EMA200,
+don't long. The mirror would be: when BTC EMA48 < EMA200, consider shorting bounces in weak
+coins.
+
+4.5 Is shorting worth it for this bot, today?
+
+Direct answer: not yet, and putting the current strategy on futures of any flavor will lose money.
+Three conditions need to be met first:
+
+    The long-side strategy needs to clear round-trip fees on average. It doesn't. Win:loss ratio
+    improvement is required. Either tighter stops, partial-profit-taking, or wider thresholds for catching
+    bigger moves.
+    The bot needs a separate short-trigger signal distinct from the long trigger. The mirror image of
+    "pullback after pump" isn't "bounce after dump" -- bounces after dumps usually succeed in crypto.
+    The real short signal is "failed bounce after dump" -- price tries to recover, fails to clear resistance,
+    rolls over. Different pattern.
+    Sample size on shorts needs to be backtestable. That means at least one bear or distribution
+    market in the backtest window. Our 30-day window has BTC up 26% -- there is no shortable regime,
+    so we cannot validate shorts on this data.
+
+To get from here to "futures with shorts" responsibly:
+· Tune the long side so it clears futures friction. Bar: avg win  0.5%, win rate  55%, profit factor  1.4.
+· Wait for or download a bear-market window in the historical data.
+· Implement short logic (mirror image with the right pattern) and backtest it on that bear window.
+· Only then flip the live config to futures, dry-run for 2 weeks, and finally consider live.
+
+This sequence is the difference between "futures bot that loses money quickly" and "futures bot that
+captures both directions of crypto's volatility."
+
+PART 5 -- Recommendations, ranked by leverage
+
+Tier A -- Cheap, measurable wins (do these next)
+
+    Use the unused LSR / taker-buy-sell data. Already in Postgres. Adding top_trader_lsr_z and
+    taker_buy_sell_ratio as gates is a 30-line change.
+    Replace the fixed 3% stop with ATR-based stops. ta.ATR(dataframe, timeperiod=14) then
+    stoploss_pct = max(0.015, atr / close * 1.5). Volatile coins get wider stops, stable coins get
+    tighter ones.
+    Add take-profit ladder tuned for measured trade lengths. Backtest showed average winners last
+    23 min and gain ~1%. Set minimal_roi to take partial profit at 0.8% after 15 min, 1.5% after 30 min.
+    Locks in winners.
+    Loosen the pullback thresholds. Current pump_size > 8%, pullback 2-5%. Try pump_size > 5%,
+    pullback 1-7%. Backtest delta tells you if more trades = more profit.
+
+Tier B -- Real but bigger work
+
+    Add Binance liquidations data. Free WebSocket. Liquidation cascades are clean signals of
+    capitulation lows.
+    Add order-book depth snapshots. Detects walls and absorption. Free.
+    Add ATR and Bollinger Bands. Two more talib indicators, instant compute.
+    Build market-structure detection (HH/HL via pivot highs/lows).
+
+Tier C -- Strategy expansion
+    Add a mean-reversion entry path (oversold bounce) for ranging regimes.
+    Implement short logic mirroring the long side with the correct pattern (failed bounce, not bounce).
+    Backtest on bear windows.
+
+Tier D -- Only after A­C are validated
+
+    Switch to futures in dry-run. Validate that fees + funding don't kill the edge.
+    ML on top of validated features. LightGBM on the existing feature set, trained to predict
+    next-N-candle return.
+    Consider paid data (Glassnode, CryptoQuant) only if Tier A­C have diminishing returns.
+
+TL;DR -- direct answers
+
+Is the bot getting the best information?
+No. It gets good, free, broad information, but with clear gaps: (a) three valuable signals (LSR ratios,
+taker buy/sell ratio) collected and not used in the strategy; (b) missing order-book depth and liquidations,
+both free and high-value; (c) missing common indicators like ATR and Bollinger.
+Is the strategy the best?
+Reasonable family (pullback-in-trend), but currently a thin prototype: 5 trades / 30 days, +0.05% per
+trade, likely below round-trip fees in real conditions. Structural fixes (ATR stops, ROI ladder tuning,
+more triggers) are clear next steps.
+Is futures + shorts worth it?
+Not yet. Current edge is below the fee floor on spot already, futures funding cost would push it deeper
+into the red, and shorts can't be validated against our current (all-bull-market) backtest data. Honest
+sequence: (1) tune longs to clearly clear fees, (2) acquire bear-market historical data, (3) write and
+backtest short logic, (4) switch live to futures dry-run, (5) only then real money on shorts. Anything faster
+is gambling, not trading.
+
