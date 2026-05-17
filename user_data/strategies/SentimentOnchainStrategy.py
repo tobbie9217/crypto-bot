@@ -43,6 +43,11 @@ from db_pool import get_conn, report_db_error
 class SentimentOnchainStrategy(IStrategy):
     INTERFACE_VERSION = 3
 
+    # Shorts are designed but only fire when the config is futures-mode.
+    # In spot mode the engine ignores enter_short signals so this is safe
+    # to leave on. See work_log 2026-05-17 and deep_research.txt Part 4.
+    can_short = True
+
     timeframe = "5m"
     # Higher timeframe used as a trend gate. Filters out 5m noise that
     # cuts against the 1h trend.
@@ -192,7 +197,44 @@ class SentimentOnchainStrategy(IStrategy):
     MOMENTUM_VETO_SENTIMENT_COUNT_MIN = 5    # ...and we have 5+ posts
     MOMENTUM_VETO_TOP_TRADER_LSR_MIN = 0.7   # block if top traders heavily short
 
+    # --- Short entry path: "FAILED BOUNCE AFTER DUMP" -----------------------
+    # Per deep_research.txt Part 4.4: do NOT mirror "bounce after dump" — in
+    # downtrends, bounces are death-traps for shorts. The real edge is
+    # "price tries to recover, fails to clear resistance, rolls over". We
+    # detect: (1) significant dump in last hour, (2) partial bounce off
+    # the low, (3) failure — close still below pre-dump price AND below
+    # 21-EMA on 5m AND last 3 closes descending. Macro gate: BTC in
+    # downtrend AND data available (tri-state regime).
+    SHORT_DUMP_SIZE_MIN_PCT      = 5.0    # ≥5% dump from 12 bars ago to recent low
+    SHORT_BOUNCE_MIN_PCT         = 1.5    # current close ≥1.5% above recent low
+    SHORT_BOUNCE_MAX_PCT         = 4.0    # but ≤4% — beyond that the bounce is too strong
+    SHORT_RECOVERY_FRACTION_MAX  = 0.6    # close must still be in lower 60% of the dump range
+    SHORT_RSI_MIN                = 40     # RSI lifted off oversold (bounce happened)
+    SHORT_RSI_MAX                = 65     # but not into overbought (would mean real recovery)
+    # Soft gates flipped from the long side. Same _available pattern:
+    # block only when signal present AND clearly contrary.
+    SHORT_TOP_TRADER_LSR_MAX     = 1.3    # block if top traders heavily long (would invalidate)
+    SHORT_TAKER_BUY_SELL_MAX     = 1.4    # block if buying frenzy still active
+    SHORT_SMART_MONEY_DIV_MAX    = 0.1    # block if top-trader-vs-retail bias is bullish
+
+    # Risk overrides for short-tagged trades — same fractional sizing as
+    # momentum since both are higher-risk paths
+    SHORT_STAKE_FRACTION = 0.30
+    SHORT_TRAILING_STOP  = 0.01           # 1% trailing once in profit (price rising = short loses)
+    SHORT_HARD_STOP      = -0.03          # 3% hard stop (in short P&L terms — i.e. price rose 3%)
+
     # ----------------------- Higher-timeframe wiring -----------------------
+
+    def _btc_pair(self) -> str:
+        """BTC pair name in the format matching the current trading mode.
+        Spot uses 'BTC/USDT'; futures uses 'BTC/USDT:USDT' (settlement
+        currency suffix). Defaults to spot when config is unavailable."""
+        try:
+            if str(self.config.get("trading_mode", "spot")).lower() == "futures":
+                return "BTC/USDT:USDT"
+        except Exception:
+            pass
+        return "BTC/USDT"
 
     def informative_pairs(self):
         # Provide 1h candles for every pair in the active whitelist so we
@@ -201,8 +243,9 @@ class SentimentOnchainStrategy(IStrategy):
         out = [(p, self.informative_timeframe) for p in pairs]
         # BTC 1h is used as a market-regime gate — entries are paused when
         # BTC's 48-period 1h EMA is below its 200-period 1h EMA.
-        if ("BTC/USDT", "1h") not in out:
-            out.append(("BTC/USDT", "1h"))
+        btc = self._btc_pair()
+        if (btc, "1h") not in out:
+            out.append((btc, "1h"))
         return out
 
     # ----------------------- DB helpers -----------------------
@@ -470,12 +513,32 @@ class SentimentOnchainStrategy(IStrategy):
             (recent_high - dataframe["close"]) / recent_high
         ) * 100.0
 
+        # --- Failed-bounce-after-dump features (short side) ---
+        # Mirror of the pump features but tracking the dump and the partial
+        # recovery off the low. recovery_pct_of_dump = 0 means we're still
+        # at the low; 100 means we've fully reclaimed the pre-dump close.
+        # Short entry wants moderate recovery (1.5-4%) but bounded
+        # recovery_pct (<60%) — i.e. the bounce didn't fully reclaim.
+        recent_low = dataframe["close"].rolling(window=12).min()
+        dataframe["dump_size_pct"] = ((price_12_ago - recent_low) / price_12_ago) * 100.0
+        dataframe["bounce_from_low_pct"] = (
+            (dataframe["close"] - recent_low) / recent_low
+        ) * 100.0
+        _dump_range = (price_12_ago - recent_low).replace(0, pd.NA)
+        dataframe["recovery_pct_of_dump"] = (
+            (dataframe["close"] - recent_low) / _dump_range
+        ).fillna(0.0)
+        dataframe["closes_descending_3"] = (
+            (dataframe["close"] < dataframe["close"].shift(1))
+            & (dataframe["close"].shift(1) < dataframe["close"].shift(2))
+        ).astype(int)
+
         # --- BTC market-regime gate ---
         # Read BTC 1h candles independently of the trading pair, compute
         # EMA(48) and EMA(200), and mark each row 1 (uptrend) or 0 (down).
         # 48 × 1h ≈ 2 days, 200 × 1h ≈ 8 days — slow enough to ignore
         # intraday chop, fast enough to react to a market turn.
-        btc_1h = self.dp.get_pair_dataframe(pair="BTC/USDT", timeframe="1h")
+        btc_1h = self.dp.get_pair_dataframe(pair=self._btc_pair(), timeframe="1h")
         if btc_1h is not None and not btc_1h.empty and len(btc_1h) >= 200:
             btc_1h = btc_1h.copy()
             btc_1h["btc_ema_fast"] = ta.EMA(btc_1h, timeperiod=48)
@@ -483,7 +546,8 @@ class SentimentOnchainStrategy(IStrategy):
             btc_1h["btc_trend_up"] = (
                 btc_1h["btc_ema_fast"] > btc_1h["btc_ema_slow"]
             ).astype(int)
-            regime = btc_1h[["date", "btc_trend_up"]].copy()
+            btc_1h["btc_regime_known"] = 1
+            regime = btc_1h[["date", "btc_trend_up", "btc_regime_known"]].copy()
             regime["date"] = pd.to_datetime(regime["date"], utc=True).astype("datetime64[ms, UTC]")
             df = dataframe.sort_values("date").copy()
             df["date"] = pd.to_datetime(df["date"], utc=True).astype("datetime64[ms, UTC]")
@@ -492,11 +556,12 @@ class SentimentOnchainStrategy(IStrategy):
                 direction="backward", tolerance=pd.Timedelta(hours=2),
             )
             dataframe["btc_trend_up"] = dataframe["btc_trend_up"].fillna(0).astype(int)
+            dataframe["btc_regime_known"] = dataframe["btc_regime_known"].fillna(0).astype(int)
         else:
-            # Not enough BTC history yet — fail closed (no new entries).
-            # 200 × 1h ≈ 8 days warmup; first runs after a fresh start will
-            # see this default until enough BTC data has been collected.
+            # Not enough BTC history yet — fail closed for BOTH paths
+            # (longs and shorts). 200 × 1h ≈ 8 days warmup.
             dataframe["btc_trend_up"] = 0
+            dataframe["btc_regime_known"] = 0
 
         coin = metadata["pair"].split("/")[0]
 
@@ -596,7 +661,10 @@ class SentimentOnchainStrategy(IStrategy):
         # paths. When BTC's 1h EMA(48) is below EMA(200) (i.e., medium-
         # term downtrend), no new longs are taken — historically the
         # single biggest survival fix for momentum strategies.
-        regime_ok = dataframe["btc_trend_up"] == 1
+        # btc_regime_known guards against the BTC-data-missing case so
+        # both directions fail closed during warmup.
+        regime_ok = (dataframe["btc_regime_known"] == 1) & (dataframe["btc_trend_up"] == 1)
+        regime_down = (dataframe["btc_regime_known"] == 1) & (dataframe["btc_trend_up"] == 0)
 
         # Order-flow soft gates — same _available pattern as funding/fng.
         # Blocks an entry only when the signal is *present* and *clearly
@@ -674,6 +742,44 @@ class SentimentOnchainStrategy(IStrategy):
         momentum = (momentum_pullback | momentum_chatter) & (~strict)
         dataframe.loc[momentum, ["enter_long", "enter_tag"]] = (1, "momentum")
 
+        # ----- Short path: FAILED BOUNCE AFTER DUMP -----
+        # Soft gates flipped from the long side: block only when the
+        # signal is *available* AND clearly contrary to a short
+        # (top traders very long / aggressive buying still active /
+        # smart money biased bullish). Missing data = trade allowed.
+        short_top_trader_ok = (
+            (dataframe["top_trader_lsr_available"] == 0)
+            | (dataframe["top_trader_lsr"] <= self.SHORT_TOP_TRADER_LSR_MAX)
+        )
+        short_taker_ok = (
+            (dataframe["taker_buy_sell_available"] == 0)
+            | (dataframe["taker_buy_sell_ratio"] <= self.SHORT_TAKER_BUY_SELL_MAX)
+        )
+        short_smart_money_ok = (
+            dataframe["smart_money_divergence"] <= self.SHORT_SMART_MONEY_DIV_MAX
+        )
+
+        # 1h trend must also be down for shorts.
+        htf_downtrend = dataframe["ema_fast_1h"] < dataframe["ema_slow_1h"]
+
+        short_failed_bounce = (
+            (dataframe["dump_size_pct"] > self.SHORT_DUMP_SIZE_MIN_PCT)
+            & (dataframe["bounce_from_low_pct"] >= self.SHORT_BOUNCE_MIN_PCT)
+            & (dataframe["bounce_from_low_pct"] <= self.SHORT_BOUNCE_MAX_PCT)
+            & (dataframe["recovery_pct_of_dump"] < self.SHORT_RECOVERY_FRACTION_MAX)
+            & (dataframe["closes_descending_3"] == 1)
+            & (dataframe["close"] < dataframe["ema_fast"])
+            & (dataframe["rsi"] > self.SHORT_RSI_MIN)
+            & (dataframe["rsi"] < self.SHORT_RSI_MAX)
+            & htf_downtrend
+            & regime_down
+            & short_top_trader_ok
+            & short_taker_ok
+            & short_smart_money_ok
+            & (dataframe["volume"] > 0)
+        )
+        dataframe.loc[short_failed_bounce, ["enter_short", "enter_tag"]] = (1, "short_failed_bounce")
+
         # Log every newly-fired entry attempt so we can later see what
         # Freqtrade's protections / max_open_trades / slippage rejected
         # vs what got through to confirm_trade_entry.
@@ -685,17 +791,22 @@ class SentimentOnchainStrategy(IStrategy):
         self, dataframe: DataFrame, pair: Optional[str]
     ) -> None:
         """Log an 'attempted_entry' row only on the candle where
-        enter_long transitions 0 -> 1 (deduped against persistent flags)."""
+        enter_long OR enter_short transitions 0 -> 1 (deduped against
+        persistent flags). Captures the direction in the side field."""
         if pair is None or len(dataframe) < 2:
             return
         last = dataframe.iloc[-1]
         prev = dataframe.iloc[-2]
         try:
-            last_flag = int(last.get("enter_long") or 0)
-            prev_flag = int(prev.get("enter_long") or 0)
+            last_long = int(last.get("enter_long") or 0)
+            prev_long = int(prev.get("enter_long") or 0)
+            last_short = int(last.get("enter_short") or 0)
+            prev_short = int(prev.get("enter_short") or 0)
         except (TypeError, ValueError):
             return
-        if last_flag != 1 or prev_flag == 1:
+        long_fired = last_long == 1 and prev_long == 0
+        short_fired = last_short == 1 and prev_short == 0
+        if not (long_fired or short_fired):
             return
         tag = last.get("enter_tag")
         if hasattr(tag, "item"):
@@ -713,9 +824,9 @@ class SentimentOnchainStrategy(IStrategy):
         )
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # Exit conditions apply to BOTH paths. Momentum trades typically
-        # exit via the trailing stop in custom_stoploss before reaching
-        # these — that's by design.
+        # Exit conditions apply to BOTH long paths. Momentum trades
+        # typically exit via the trailing stop in custom_stoploss before
+        # reaching these — that's by design.
         dataframe.loc[
             (
                 (
@@ -727,6 +838,25 @@ class SentimentOnchainStrategy(IStrategy):
                 & (dataframe["volume"] > 0)
             ),
             "exit_long",
+        ] = 1
+
+        # Short exits — mirror of long, with thresholds flipped.
+        # A short trade is hurt by: sentiment turning bullish, funding
+        # going very negative (shorts pay), F&G turning to extreme fear
+        # (capitulation = bounce risk), RSI dropping to oversold (likely
+        # reversal up). Most short trades will exit via trailing stop or
+        # ROI before these fire.
+        dataframe.loc[
+            (
+                (
+                    (dataframe["sentiment_mean"] > -self.SENTIMENT_FLIP_NEG)  # > +0.1
+                    | (dataframe["funding_rate"] < -self.FUNDING_MAX_EXIT)
+                    | (dataframe["fng"] < (100 - self.FNG_MAX_EXIT))           # < 15
+                    | (dataframe["rsi"] < (100 - self.RSI_OVERBOUGHT))         # < 20
+                )
+                & (dataframe["volume"] > 0)
+            ),
+            "exit_short",
         ] = 1
         return dataframe
 
@@ -746,9 +876,13 @@ class SentimentOnchainStrategy(IStrategy):
         **kwargs,
     ) -> float:
         # Momentum entries are inherently riskier — size them at a fraction
-        # of the strict-path stake.
+        # of the strict-path stake. Short entries get the same treatment
+        # for the same reason (failed-bounce thesis is unvalidated until
+        # the bear-window backtest completes).
         if entry_tag == "momentum":
             return max(min_stake or 0, proposed_stake * self.MOMENTUM_STAKE_FRACTION)
+        if entry_tag == "short_failed_bounce":
+            return max(min_stake or 0, proposed_stake * self.SHORT_STAKE_FRACTION)
         return proposed_stake
 
     def _atr_stop_for_pair(self, pair: str) -> Optional[float]:
@@ -824,6 +958,10 @@ class SentimentOnchainStrategy(IStrategy):
         "global_account_lsr", "global_account_lsr_available",
         "taker_buy_sell_ratio", "taker_buy_sell_available",
         "smart_money_divergence",
+        # Short-side features
+        "dump_size_pct", "bounce_from_low_pct",
+        "recovery_pct_of_dump", "closes_descending_3",
+        "btc_trend_up", "btc_regime_known",
     )
 
     def _snapshot_features(self, pair: str) -> dict:
@@ -922,6 +1060,19 @@ class SentimentOnchainStrategy(IStrategy):
             "MOMENTUM_VETO_SENTIMENT_MIN":         self.MOMENTUM_VETO_SENTIMENT_MIN,
             "MOMENTUM_VETO_SENTIMENT_COUNT_MIN":   self.MOMENTUM_VETO_SENTIMENT_COUNT_MIN,
             "MOMENTUM_VETO_TOP_TRADER_LSR_MIN":    self.MOMENTUM_VETO_TOP_TRADER_LSR_MIN,
+            # Short-side
+            "SHORT_DUMP_SIZE_MIN_PCT":             self.SHORT_DUMP_SIZE_MIN_PCT,
+            "SHORT_BOUNCE_MIN_PCT":                self.SHORT_BOUNCE_MIN_PCT,
+            "SHORT_BOUNCE_MAX_PCT":                self.SHORT_BOUNCE_MAX_PCT,
+            "SHORT_RECOVERY_FRACTION_MAX":         self.SHORT_RECOVERY_FRACTION_MAX,
+            "SHORT_RSI_MIN":                       self.SHORT_RSI_MIN,
+            "SHORT_RSI_MAX":                       self.SHORT_RSI_MAX,
+            "SHORT_TOP_TRADER_LSR_MAX":            self.SHORT_TOP_TRADER_LSR_MAX,
+            "SHORT_TAKER_BUY_SELL_MAX":            self.SHORT_TAKER_BUY_SELL_MAX,
+            "SHORT_SMART_MONEY_DIV_MAX":           self.SHORT_SMART_MONEY_DIV_MAX,
+            "SHORT_STAKE_FRACTION":                self.SHORT_STAKE_FRACTION,
+            "SHORT_TRAILING_STOP":                 self.SHORT_TRAILING_STOP,
+            "SHORT_HARD_STOP":                     self.SHORT_HARD_STOP,
         }
 
     def _log_trade_event(

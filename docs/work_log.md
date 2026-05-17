@@ -161,6 +161,115 @@ collecting data for future use.
 
 ---
 
+## 2026-05-17 (cont.) — Short side also fails; 5m thesis structurally broken
+
+This session continued same-day from the morning's no-edge finding. We
+implemented the short logic, set up futures-mode backtest, and ran it on
+a real bear window. The result invalidated the *entire pump-pullback /
+dump-bounce thesis at the 5m timeframe*, not just the long side.
+
+### What got built
+
+| Component | File / change | Status |
+|---|---|---|
+| Short logic | `SentimentOnchainStrategy.py` — `can_short=True`, SHORT_* thresholds, dump/bounce/lower-high indicators, `short_failed_bounce` entry tag, mirrored short exits, snapshot + thresholds dict updated | Code-complete |
+| Format-aware BTC pair | `_btc_pair()` helper — returns `BTC/USDT` in spot, `BTC/USDT:USDT` in futures. Used by `informative_pairs()` and `get_pair_dataframe()` for the regime gate | ✅ |
+| Tri-state BTC regime | `btc_regime_known` column added so both long and short paths fail closed when BTC data is missing (was previously fail-open for shorts) | ✅ |
+| Futures backtest config | New `user_data/config_backtest_futures.json` — `trading_mode: futures`, `margin_mode: isolated`, `liquidation_buffer: 0.05`, `:USDT` suffix on 29-pair whitelist, `entry/exit_pricing.price_side: "other"` + `use_order_book: true` (futures requires these — spot config rejected with "Ticker pricing not available") | ✅ |
+| Bear-window data | OHLCV for 2024-06 to 2024-10 downloaded for both spot (`config_backtest.json` whitelist, 35/36 pairs back to listing date) and futures (`config_backtest_futures.json`, 28 pairs with mark + funding-rate streams) | ✅ |
+
+### Bear-window futures backtest results (2024-06-04 → 2024-09-30)
+
+| Metric | Value |
+|---|---|
+| Window | ~120 days |
+| Market change | **−15.12%** (real bear: BTC down to −27% mid-window, recovered to −6%) |
+| Long trades | 0 (BTC regime down → no longs ever fire — expected) |
+| **Short trades** | **6** |
+| Win rate | 50% (3W/3L) |
+| Profit factor | 0.65 |
+| Net P&L | −$3.33 / $10k |
+| Best trade | SAGA +1.59% in 5 min |
+| Worst trade | DOGE −2.97% in 10 min |
+| All exits via | `trailing_stop_loss` (same as longs) |
+
+### The critical finding from per-trade analysis
+
+**5 of 6 trades happened on August 5, 2024** — the famous yen-carry-unwind
+flash-crash day where BTC dropped ~15% intraday. The 6th was Aug 3. In
+the other **~119 days of the window, the strategy produced ZERO entries.**
+
+| # | Pair | Date | Duration | Profit |
+|---|---|---|---|---|
+| 1 | SAGA | 2024-08-03 13:45 | 5 min | +1.59% |
+| 2 | SOL | 2024-08-05 05:50 | 5 min | +1.14% |
+| 3 | SUI | 2024-08-05 07:15 | 10 min | −2.60% |
+| 4 | DOGE | 2024-08-05 07:15 | 10 min | −2.97% |
+| 5 | SEI | 2024-08-05 10:35 | 10 min | −0.76% |
+| 6 | TAO | 2024-08-05 11:00 | 5 min | +1.37% |
+
+Wins caught continuation moves down; losses caught V-bottom reversals.
+Within a single flash-crash day, "is the next 5-10 minutes continuation
+or reversal?" is essentially a coin flip. The strategy doesn't predict
+direction during the only event it fires on.
+
+### What this means structurally
+
+The strategy isn't a "failed-bounce-after-dump" strategy. With these
+gates, it's a **flash-crash detector that can't predict direction
+within the crash**. The intersection of (`dump ≥5% in 1h`, bounce 1.5-4%,
+lower-high, descending 3 closes, RSI 40-65, BTC regime down, soft gates)
+basically only happens during black-swan events.
+
+Combined with the morning's finding that the long side lacks edge in
+a +9.45% bull, and both sides die the same way (trailing-stop exits
+on too-tight stops), the conclusion is structural: **the 5m pump/dump
++ pullback/bounce + multi-signal-gate thesis does not produce a
+profitable strategy in either direction**, regardless of regime.
+
+### Decision: major pivot
+
+Stop tuning this thesis. Three real directions worth exploring next,
+ranked by expected leverage:
+
+1. **Funding-rate cash-and-carry** (deep_research Part 4.4): short the
+   perp when funding is extreme positive, hold spot. Market-neutral,
+   edge comes from funding payments not price direction. Doesn't
+   require predicting reversals. Most aligned with what we know works
+   per the research; needs new strategy file but reuses the data
+   infrastructure
+2. **Switch timeframe to 1h or 4h**: same indicator stack, much less
+   noise. The 5m findings might be entirely a signal-to-noise problem.
+   Cheap to test before bigger pivots
+3. **Reduce pair scope to top-5 majors + use 1h**: BTC/ETH/SOL/BNB/XRP
+   have the cleanest data, lowest spread, deepest order books. The 5m
+   alt-coin universe may be where most of the noise is
+
+### Live state
+
+- Freqtrade container still stopped (`docker compose stop freqtrade`
+  from earlier today). Do not restart until pivot produces something
+  testable
+- Strategy file now has short logic + can_short=True + futures-aware
+  BTC pair. Will load cleanly in either spot or futures backtests
+- `user_data/config_backtest_futures.json` is the futures-mode template
+  for any future short backtest work
+- Bear-window OHLCV (spot + futures) preserved in data dir; no need
+  to re-download for any future short experiments on the same window
+
+### Project state at end of session (cumulative for 2026-05-17)
+
+- Both long-only spot and short-only futures backtests done; both lose
+- Negative findings documented exhaustively; do not re-test the same
+  parameter/timeframe/signal-stack combinations
+- Concrete pivot directions identified; next session needs a design
+  conversation on which to pursue
+- Reddit API still pending (submitted 2026-05-12)
+- Hetzner not yet provisioned — defer until pivot has something tested
+- All ingest collectors running, postgres healthy, audit_bot live
+
+---
+
 ## 2026-05-13 — Part 1 + Part 2 of `docs/deep_research.pdf` shipped, deployed, backtested
 
 ### Summary
